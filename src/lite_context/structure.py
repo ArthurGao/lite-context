@@ -75,3 +75,11 @@ def human_turns(messages: Sequence[Message]) -> list[tuple[int, int]]:
 def last_human(messages: Sequence[Message]) -> int | None:
     turns = human_turns(messages)
     return turns[-1][0] if turns else None
+
+
+def pinned_prefix(messages: Sequence[Message]) -> int:
+    """How many messages at the start are pinned (a task statement, say)."""
+    n = 0
+    while n < len(messages) and messages[n].pinned:
+        n += 1
+    return n

@@ -36,3 +36,11 @@ class UnreportedChange(LiteContextError):
 
 class ProtectedChange(LiteContextError):
     """A step touched a pinned message, the last human turn or a thinking block (§5.2)."""
+
+
+class EmptySummary(LiteContextError):
+    """The summariser replied with nothing usable (design §6.1)."""
+
+
+class TruncatedSummary(LiteContextError):
+    """The summary was cut off by the output limit: half a summary cannot stand for the history."""

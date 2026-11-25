@@ -87,3 +87,41 @@ def test_a_growing_history_replays_stably(seed: int) -> None:
             one.messages,
             msgs[h].key if h is not None else None,
         )
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_a_growing_history_with_summaries_replays_stably(seed: int) -> None:
+    from lite_context import SummaryPolicy, plan_compaction
+
+    r = random.Random(seed)
+    msgs = history(r)
+    steps: list[Step] = [TruncateToolResults(120), MaskToolResults(r.randint(0, 2))]
+    policy = SummaryPolicy(keep_last_turns=r.randint(1, 3), mark="m" * 16)
+    budget = Budget(int(count_messages(msgs, COUNTER) * r.uniform(0.1, 0.3)) + 500, 0)
+    state = ContextState()
+    previous: list[Message] = []
+    previous_human: str | None = None
+    summaries = 0
+    for end in range(1, len(msgs) + 1):
+        try:
+            one = fit(msgs[:end], budget=budget, steps=steps, state=state, counter=COUNTER)
+        except DoesNotFit:
+            return
+        if one.state == state:
+            changed = [a.key for a, b in zip(previous, one.messages, strict=False) if a != b]
+            assert set(changed) <= {previous_human}, (end, changed)
+        state, previous = one.state, one.messages
+        if one.report.compaction_due:
+            plan = plan_compaction(msgs[:end], state=state, policy=policy)
+            if plan is not None:
+                state = plan.accept(f"summary {summaries}")
+                summaries += 1
+                try:
+                    after = fit(
+                        msgs[:end], budget=budget, steps=steps, state=state, counter=COUNTER
+                    )
+                except DoesNotFit:
+                    return
+                previous = after.messages
+        h = last_human(msgs[:end])
+        previous_human = msgs[h].key if h is not None else None

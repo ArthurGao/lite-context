@@ -18,6 +18,7 @@ CORE = [
     "lite_context.state",
     "lite_context.fit",
     "lite_context.testing",
+    "lite_context.compaction",
 ]
 
 PROBE = """

@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C1a 完成（2026-11-26）：`fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C1 完成（2026-11-26）：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -293,31 +293,44 @@ class ContextState:
 @dataclass(frozen=True)
 class Compaction:
     covers_through: str      # key of the last message the summary covers
-    covered_count: int       # how many messages it covers (after the leading pinned prefix)
-    covered_digest: str      # sha256 over the covered messages' keys, in order
+    covered_digest: str      # sha256 over the covered messages' keys, in order (after the pinned prefix)
     text: str                # exactly what the model is shown, preamble included
     provenance: Mapping[str, object]   # role / vendor / model / usage, as the caller's LLM layer reports them
-    created_at: datetime
+    created_at: str          # ISO 8601
 ```
+
+`Compaction` 存在 `ContextState.compaction` 里，和切点一起序列化（`to_json()` / `from_json()`）。
 
 ### 6.1 写摘要
 
 ```python
-plan = plan_compaction(messages, state=saved_state, policy=SummaryPolicy(keep_last_turns=4), counter=...)
-# plan.prompt: messages for the summarising call; plan.covers_through: the cut
-reply_text = await my_llm.call(role="compact", messages=plan.prompt)      # the caller's own role layer
-new_state = plan.accept(reply_text, provenance=...)   # raises EmptySummary / TruncatedSummary
-store(new_state)                                      # the caller persists it next to its history
+if fitted.report.compaction_due:
+    plan = plan_compaction(messages, state=saved_state, policy=SummaryPolicy(keep_last_turns=4))
+    if plan is not None:                     # None: nothing new can be covered
+        reply = my_llm.call(role="compact", system=plan.system, messages=plan.prompt)  # the caller's role
+        new_state = plan.accept(reply.text, truncated=reply.stopped_at_limit, provenance=reply.provenance)
+        store(new_state)                     # raises EmptySummary / TruncatedSummary instead
 ```
 
-- 便捷函数 `acompact(messages, state, summarize=fn, ...)` 把三步合在一起；`fn` 是调用方给的 async 函数。
+- `plan.covered` 是摘要将代表的消息的 key（从 pinned 前缀之后算），`plan.covers_through` 是最后一个；覆盖范围的
+  终点永远是某一轮的开头（`keep_last_turns` 至少为 1，当前这一轮和没完成的批次永远不进摘要；轮数不比要保留的多、
+  或者没有人话的历史，都返回 None）。
+- `accept` 的 `provenance` 按 JSON 往返之后的样子保存（tuple 变 list），不是 JSON 的值立刻 `ValueError`，不等到
+  存储时才失败。
+- 便捷函数 `await acompact(messages, state=..., summarize=fn, policy=...)` 把三步合在一起；`fn(system, prompt)` 是
+  调用方给的 async 函数，返回 `Summary(text, truncated, provenance)`；没有新内容可覆盖时返回 None。
+- `accept` 返回的 `state` 只有新摘要、没有切点（§5.4）。
 - **覆盖范围**：从历史开头的 pinned 前缀（比如最初的任务说明）之后开始，到切点为止。范围里不能有 pinned 消息：
   切点最远到下一条 pinned 消息之前，所以 pinned 消息永远留在原来的位置，顺序不变。
 - 切点只落在轮的边界上（§3.1），所以不会拆开批次。后一次压缩从头覆盖，把前一次的摘要也吃进去；被截断或为空的
   摘要算失败，不能顶替历史。这几条沿用 lite-agent S3b。
-- **`SummaryPolicy` 是可替换的**：怎么数"保留最近几轮"、怎么把历史渲染成给摘要模型的文本（lite-agent 用随机
-  token 的头标、去掉复制进来的头标行、去掉 thinking 块）、前言写什么，都在 policy 里。默认 policy 用本节的规则；
-  lite-agent 在 C7 提供它自己的 policy，从而保持它现有的行为。
+- **`SummaryPolicy` 是可替换的**：`keep_last_turns`、`render(previous, messages) -> (system, transcript)`、
+  `wrap(mark, reply) -> text`、`unwrap(text)`。`mark` 每个 plan 定一次、记在 plan 上，`wrap` 只去掉带这个 mark 的
+  头标行（任何字符串的 mark 都行）；前一次的摘要去掉前言再交给模型，免得前言被抄进新摘要、再套一层。默认 policy 照搬 lite-agent 实测过的做法（它的 §15 S3b）：transcript 的每一段以带随机
+  token 的头标开头（tool 结果里的文字冒充不了用户）；说明在 transcript 之后再说一遍（小模型否则会回答 transcript
+  里最后一个问题，6 次里 6 次）；去掉回复里抄进来的头标行；thinking 块不进 transcript，图片写成 `[image]`；前一次的
+  摘要作为第一段 `earlier summary` 放进去。`mark` 可以传入（测试用），默认每次随机。lite-agent 在 C7 提供它自己的
+  policy，从而保持它现有的行为。
 - 需要 `key`：没有 key 的历史不能压缩（报错）。key 只要求在一份历史里唯一，**不要求可比较**（UUID 也行）。
 
 ### 6.2 应用摘要
@@ -326,10 +339,16 @@ store(new_state)                                      # the caller persists it n
 消息 `summarised`、摘要消息 `inserted`），经过同一个运行时检查，不另写一份规则：
 
 1. 找到 `c.covers_through` 的位置；找不到 → `StaleState`。
-2. 从 pinned 前缀之后到这个位置的消息数必须等于 `c.covered_count`，它们 key 的摘要值必须等于 `c.covered_digest`；
+2. 从 pinned 前缀之后到这个位置的消息，它们 key 的摘要值必须等于 `c.covered_digest`（条数变了摘要值也会变，所以
+   不另存条数，C1b 收尾时去掉了 `covered_count`）；
    不相等（切点之前有消息被插入、删除或改了 key）→ `StaleState`。不悄悄套用一个过期的摘要。
 3. 这个位置必须是轮的边界，范围里不能有 pinned 消息；否则 → `StaleState`。
-4. 输出：pinned 前缀原样，然后一条 user 消息（内容就是 `c.text`），然后切点之后的消息。只用最近的一条 `Compaction`。
+4. 输出：pinned 前缀原样，然后一条 user 消息（内容就是 `c.text`，ref `+compaction`），然后切点之后的消息。只用
+   最近的一条 `Compaction`。之后的削减步骤在这个结果上工作，所以切点量的是摘要之后的历史（§5.4）。
+5. 消息没有 key 而 `state` 里有摘要 → `StaleState`。
+
+摘要消息是一条 user 消息，后面通常紧跟着下一轮人话（也是 user），前面有 pinned 前缀时还会更多：连续的 user 消息。
+Anthropic 会把它们合并，OpenAI 接受；要求严格交替的后端（有些本地模型的 chat template）需要宿主自己合并。
 
 切点之前的消息**内容**被改过（key 不变）时检查不出来；这是调用方的约定：被摘要覆盖的消息不再修改。要改就丢掉
 `state`，重新压缩。
@@ -582,6 +601,46 @@ lite-context/
   随机增长探针收进仓库：`tests/test_growth.py`（150 个种子，每次检查无异常、同输入同输出、切点没动时前缀不变）；
   另外手动多跑了 1000 个种子，没有失败。
   见红补充：消息边界、最省回退、单位排序、唯一 ref、不采用更贵的切点这几处都用破坏代码的方式确认有测试变红。
+
+- **C1b（2026-11-26）**：`compaction.py`（`SummaryPolicy`、`plan_compaction`、`CompactionPlan.accept`、`acompact`、
+  `Summary`、`covered_end`）；`Compaction` 放进 `state.py`，`ContextState.compaction` 随 JSON 存取；`fit()` 把应用摘要
+  作为内部步骤、走同一个运行时检查；新错误 `EmptySummary`、`TruncatedSummary`。与本文的偏差：`created_at` 是 ISO
+  字符串；`covered_count` 去掉（摘要值已经覆盖条数）；`plan.covered` 给出覆盖的 key。
+  规则 → 测试（`tests/test_compaction.py`，除另注）：
+  - 覆盖范围：`test_a_plan_covers_every_turn_but_the_kept_ones_and_renders_them`、
+    `test_a_pinned_prefix_stays_out_and_a_later_pinned_message_stops_the_cut`、`test_nothing_to_cover_gives_no_plan`、
+    `test_compaction_needs_keys`。
+  - 后一次吃进前一次：`test_a_later_compaction_takes_in_the_earlier_summary`、
+    `test_nothing_new_to_cover_after_a_compaction_gives_no_plan`。
+  - 截断、空摘要失败，抄进来的头标去掉：`test_an_empty_or_truncated_summary_is_refused`、
+    `test_header_lines_the_model_copied_are_removed`。
+  - 应用摘要、报告、输入不变：`test_fit_shows_the_summary_in_place_of_what_it_covers_and_reports_it`。
+  - 过期：`test_a_summary_that_no_longer_matches_the_history_is_stale`（删掉覆盖的最后一条、之前插入、改 key、
+    不在轮边界）、`test_a_summary_with_keyless_messages_is_stale`。
+  - 切点量摘要之后的历史、新摘要不带切点：`test_cuts_are_measured_after_the_summary_and_start_again_after_a_new_one`。
+  - JSON：`test_state_with_a_compaction_survives_json`；`acompact`：`test_acompact_plans_calls_the_callers_model_and_accepts`。
+  - 端到端：`tests/test_growth.py::test_a_growing_history_with_summaries_replays_stably`（60 个种子，需要时就写摘要，
+    共写了 60 次；无异常、切点和摘要都没动时前缀不变）。
+  见红：测试先写，没有实现时收集失败；之后破坏 10 处（摘要值、轮边界、截断、头标清理、停在 pinned、没有新内容、
+  吃进前一次、`state` 保留摘要、无 key 检查、条数检查）：前 9 处有测试变红；条数检查破坏后没有测试变红，因为摘要值
+  已经覆盖条数，于是删掉了条数这个字段；无 key 检查原来没有测试，补上并见红。
+
+  收尾：`/simplify`（一个子代理，四个角度）与代码 review（Codex 不可用，子代理代替）同时跑。
+  review 7 条：1、2、5 `end` 可能落到历史末尾（`keep_last_turns=0`、没有人话、负数），摘要盖住当前一轮或没完成的
+  批次，之后的状态用不了 → `end` 永远是某一轮的开头，`keep_last_turns >= 1`
+  （`test_keep_last_turns_must_keep_at_least_the_current_turn`、`test_a_history_without_human_turns_gives_no_plan`、
+  `test_fewer_turns_than_kept_gives_no_plan`、`test_the_plan_never_covers_an_unfinished_batch_or_the_last_turn`）；
+  3 `provenance` 不是 JSON 时存储时才失败、tuple 往返不等 → `accept` 里按 JSON 规整
+  （`test_provenance_is_stored_as_json_gives_it_back`）；4 头标清理只认十六进制 mark → plan 记下 mark、只清这个
+  （`test_copied_headers_are_removed_whatever_the_mark`）；7 前一次摘要带着前言交给模型 → 先去掉
+  （`test_the_earlier_summary_goes_back_to_the_model_without_its_preamble`）；6 摘要后面是连续的 user 消息 → 写进
+  §6.2。
+  `/simplify` 8 条：采纳——两个相同的摘要函数合成 `digest`；`pinned_prefix` 移到 `structure.py`；`next()` 代替只取第一项
+  的列表；`render` 按消息拆出 `_render`；`_summarised` 只收 `entries`，`SUMMARY_REF` 放到模块开头；`Compaction` 的 JSON
+  用 `asdict` / `fields`；`__all__` 只列本模块定义的。跳过——`human_turns` 算两次（O(n)，便宜）；把 `SummaryPolicy`
+  改成 Protocol（lite-agent 在 C7 可以继承或 `replace` 它，届时再定）。
+  见红：回归测试先红后绿；修复处逐一破坏（`keep_last_turns` 校验、轮数不足、JSON 规整、按 mark 清理、去前言），
+  每处都有测试变红；"轮数不足"一处起初没有测试变红，补了 `test_fewer_turns_than_kept_gives_no_plan`。
 
 ## 15. 待确认
 

@@ -6,13 +6,16 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from .compaction import covered_end
 from .count import Budget, CharEstimate, Counter, count_message
 from .errors import DoesNotFit, ProtectedChange, StaleState, UnreportedChange
 from .report import Action, Report
-from .state import ContextState, Cut, digest
+from .state import Compaction, ContextState, Cut, digest
 from .steps import CuttingStep, Entry, Step, StepContext, Unit
-from .structure import batches, last_human
-from .types import Message, Opaque, ToolResult, check_unique
+from .structure import batches, last_human, pinned_prefix
+from .types import Message, Opaque, Text, ToolResult, check_unique
+
+SUMMARY_REF = "+compaction"  # the ref of the summary message fit() inserts
 
 
 @dataclass(frozen=True)
@@ -46,8 +49,8 @@ def fit(
     entries = _entries(messages)
     keyed = all(m.key is not None for m in messages)
     state = state or ContextState()
-    if state.cuts and not keyed:
-        raise StaleState("the state holds cuts, but the messages have no keys")
+    if (state.cuts or state.compaction) and not keyed:
+        raise StaleState("the state holds cuts or a summary, but the messages have no keys")
     batches(messages)
 
     ctx = StepContext(counter, _protected(entries))
@@ -60,6 +63,12 @@ def fit(
     tokens_before = tally.total
     actions: list[Action] = []
     cuts: dict[str, Cut] = {}
+    if state.compaction is not None:  # an internal step, under the same checks (design §6.2)
+        after, done = _summarised(entries, state.compaction, tally)
+        _check(entries, after, done, ctx)
+        tally.update(after, done)
+        entries = after
+        actions += done
     for step in steps:
         if step.always:
             after, done = step.apply(entries, ctx)
@@ -106,7 +115,22 @@ def fit(
     )
     if tokens_after > available:
         raise DoesNotFit(f"{tokens_after} tokens after every step; {available} available", report)
-    return Fitted([e.message for e in entries], ContextState(cuts), report)
+    return Fitted([e.message for e in entries], ContextState(cuts, state.compaction), report)
+
+
+def _summarised(
+    entries: Sequence[Entry], compaction: Compaction, tally: _Tally
+) -> tuple[list[Entry], list[Action]]:
+    """The pinned prefix, then the summary in place of what it covers, then the rest."""
+    messages = [e.message for e in entries]
+    start, end = pinned_prefix(messages), covered_end(messages, compaction)
+    summary = Entry(SUMMARY_REF, Message("user", (Text(compaction.text),)))
+    cost = count_message(summary.message, tally.counter)
+    done = [Action("compaction", SUMMARY_REF, "inserted", -cost)]
+    done += [
+        Action("compaction", e.ref, "summarised", tally.tokens[e.ref]) for e in entries[start:end]
+    ]
+    return [*entries[:start], summary, *entries[end:]], done
 
 
 def _entries(messages: Sequence[Message]) -> list[Entry]:

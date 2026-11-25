@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：v0.1.2（2026-11-26：被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C4 宿主 A 已接入（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -691,6 +691,22 @@ lite-context/
   拿不到刚要的结果。改成每个批次只 mask 它自己那几条结果消息里的结果，工具名也取自它自己的 call 消息
   （`test_a_call_id_reused_by_a_later_batch_does_not_mask_the_later_result`，改之前红）；随机增长测试也加了复用 id 的
   历史（它检查前缀稳定，抓不到这个错误，单元测试负责）。
+
+- **C4 宿主 A（2026-11-26）**：宿主 A 的 agent tool loop（Temporal workflow 里）在每一步调用模型前用 `fit()`
+  （`MaskToolResults(keep_last=2)`，预算 150,000，system 和 tool 定义算作 `fixed`），把 `ContextState` 留在 workflow
+  内存里一步步传；装不下时 run 以失败结束。宿主自己写了约 50 行的 adapter（它的消息类型 ↔ 中立类型，往返无损）。
+  病例流程（按页分组、对半一次）没有换：语义与 `pack` / `halving` 不同（§15）。
+  测量（合成数据：宿主 A 只允许合成数据；20 步、每个 tool 结果都是 20,000 字符上限，真实的 system 和 tool 定义）：
+  | 预算 | 不 mask 时第 20 步的估算 token | 不 mask 时超预算的步数 | mask 后最大发送量 | 切点移动的步数 | 失败 |
+  | --- | --- | --- | --- | --- | --- |
+  | 150,000（默认） | 110,013 | 0 | 110,013（什么都没 mask） | 0 | 否 |
+  | 60,000 | 110,013 | 9 / 20 | 53,039 | 4 / 20 | 否 |
+  即默认预算下行为不变；窗口小时，原本会失败的 9 步都能发出，prompt cache 只在 4 步失效。
+  接入发现并在库里修掉的：wheel 没有 `py.typed`（v0.1.1）；复用 call id 时最新结果被 mask（v0.1.2）。宿主侧另外
+  学到：lite-context 的任何异常都要结束 run 而不是让 workflow task 无限重试；`fit` 的 `DoesNotFit` 消息直接给用户
+  就够清楚（fixed 超预算的情况也说得出原因）。
+  通过条件：宿主 A 的 `make check` 全绿（后端 347、前端 33 + 51），超窗口失败在上表的场景里为 0，输入 token 不高于
+  接入前（默认预算下相等）。宿主 B 尚未接入。
 
 ## 15. 待确认
 

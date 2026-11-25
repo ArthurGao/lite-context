@@ -1,0 +1,423 @@
+# lite-context 设计文档
+
+**状态：C0 未开始（2026-11-26 立项，本文是初稿）。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
+与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
+
+## 0. 决策记录
+
+决策的理由只写在这里，其它章节引用（§0）。"owner" 是主人定的；"提议" 是起草时的判断，主人没否决前按它做，
+否决时在这里改。
+
+| 日期 | 决策 | 谁 | 原因 |
+| --- | --- | --- | --- |
+| 2026-11-26 | 单独做一个库 lite-context，只管"这一次调用，模型该看到什么"；直接调用 LLM 的项目和 lite-agent 都用它 | owner | 多数项目不用 lite-agent，直接调 LLM；它们的 chat 历史、tool 结果、长文档各自手写了一套（或没有），context rot 和超窗口直接报错是共同的缺口 |
+| 2026-11-26 | 形态：library 为主；REST API 是它上面的薄壳，不放逻辑 | owner | 与 lite-rag / lite-mem / lite-agent 一致；REST 给非 Python 的宿主 |
+| 2026-11-26 | 显式调用，不做 lite-model hook 或"所有请求自动经过"的中间层 | 提议 | 在调用层悄悄改写请求，"模型看到的"就和宿主记下的对不上，回放、审计、fork 都会错（KB `llm-app-architecture` §9）。lite-cache 能做成 hook 是因为它不改请求内容 |
+| 2026-11-26 | 核心不依赖任何 message 格式，也不依赖 lite-model：内部一套中立类型，边界上用 adapter | 提议 | 两个首批宿主都有自己的 LLM 层（一个用自有类型，一个用 Anthropic 格式的 dict），都不用 lite-model；强依赖 lite-model 等于要它们先换 LLM 层 |
+| 2026-11-26 | 原始历史永不改写；压缩是一条记下覆盖范围的 `Compaction`，它和削减的切点一起放在 `ContextState` 里，由调用方保存（§5.4） | 提议 | KB §9.1 "compaction masks and keeps provenance"。调用方本来就存历史（数据库、workflow 状态），再存一条摘要记录即可，不必为此引入 lite-context 的存储 |
+| 2026-11-26 | 装不下就报错（`DoesNotFit`），不悄悄丢内容 | 提议 | 两个首批宿主都明确选了"超限即失败"（一个 `case_too_large`，一个 `LLMInputTooLarge`），截断都当错误。lite-context 只做调用方声明过的裁剪 |
+| 2026-11-26 | 需要模型的步骤（写摘要、map-reduce 的 merge）由调用方传入函数，lite-context 自己不调模型 | 提议 | 模型调用留在宿主自己的 role 层（workspace 规则：每次调用都经过 role、带 provenance）；核心因此是纯函数，可以直接在 Temporal workflow 里用 |
+| 2026-11-26 | REST 模式下摘要默认由客户端写：服务返回写摘要用的 prompt，客户端调自己的模型后把摘要交回。服务端自己调 role 是以后的可选项 | 提议 | 服务不持有模型凭证、不花钱；模型选择和计费留在各个项目 |
+| 2026-11-26 | Python ≥ 3.11，CI 跑 3.11 和 3.12 | owner | 宿主 B 跑 3.11；纯 Python 库支持 3.11 的成本很低 |
+| 2026-11-26 | 核心零运行时依赖；lite-model adapter、tiktoken 计数器、PostgreSQL、FastAPI 各是一个 extra | 提议 | 宿主 B 用 pip requirements，依赖越少越容易接；核心是纯数据处理 |
+| 2026-11-26 | 宿主 A、B 在 C4 同时接入 | owner | 一次验证两种接入形态：tool loop 的 masking，和 chat 历史的预算 + 摘要 |
+| 2026-11-26 | 收尾流程与其它 lite 模块相同：`/simplify` → Codex 只读 review → 修复或写下否决理由 → 重跑全部检查 | owner | workspace 约定 |
+
+## 1. 概述
+
+lite-context 回答一个问题：**这一次调用，模型应该看到什么**。输入是调用方的完整历史（或一组文档、检索结果）
+和一个 token 预算；输出是这一次要发送的内容，外加一份报告，写明裁掉了什么、压缩了什么、前后各多少 token。
+发送仍由调用方自己做。
+
+三类场景：
+
+- **多轮历史**：chat、自写的 tool loop。历史越来越长，旧的 tool 结果占大头（§5、§6）。
+- **长文档、检索结果**：一次调用装不下的文档要切分、分组、map-reduce；检索结果要在预算内挑选（§7）。
+- **没有自己存储的宿主**：用 lite-context 的 `Transcript` 存历史（§8）。
+
+### 来源
+
+- KB `global/llm-app-architecture.md` §9（event log + 纯投影，压缩只遮盖）、§11（自写 loop 的截断）。
+- lite-agent 的 S3b 压缩（它的设计 §6）：摘要事件、覆盖区间、"后一次压缩从头覆盖"、切点不拆开 tool call 和结果、
+  截断或为空的摘要算失败。lite-context 把这些规则从 event log 里拿出来，变成不依赖 log 的形式。
+- 两个首批宿主的现有代码（§12）：按 token 预算把页分组、超限对半重试、分层 reduce、tool 结果在产生时截断、
+  "超限即失败"。
+- 公开研究（reported，未在本项目测过）：Chroma "Context Rot"（2025）——输入越长质量越差，远没到窗口上限就开始；
+  JetBrains "The Complexity Trap"（2025）——在 SWE-agent 上，把旧 observation 换成占位符的效果与 LLM 摘要相当、
+  成本低得多。
+
+### 目标
+
+1. 一个 `fit()` 覆盖"历史太长"的常见做法，按调用方给的顺序逐级裁剪，每一步都写进报告（§5）。
+2. 压缩可逆、可审计：原文不改，摘要是一条带覆盖范围的记录（§6）。
+3. 长文档的切分、分组、对半重试、分层 reduce 做成共用工具，模型调用由调用方传入（§7）。
+4. 不依赖任何 message 格式：Anthropic dict、OpenAI dict、lite-model 类型、宿主自有类型都能接（§3）。
+5. 不联网、不花钱就能测：核心是纯函数，需要模型的地方用调用方传入的函数，测试里传 fake。
+
+### 非目标（v1）
+
+- 不调模型（例外：以后可选的服务端摘要，§9）。
+- 不做 token 级压缩（LLMLingua 一类）；需要时作为 §7 的一个可选步骤再加（§15）。
+- 不维护模型窗口表：预算由调用方算好传入（宿主有自己的表或配置）。
+- 不做检索、embedding、rerank：那是 lite-rag。§7 的 `select` 只在已经排好序的结果里按预算挑。
+- 不做长期记忆：那是 lite-mem。
+- 不做 streaming。
+
+## 2. 分层
+
+```
+宿主（Python，自有 LLM 层）──► adapter ──► lite-context 核心（纯函数）──► adapter ──► 宿主的 LLM 层 ──► 模型
+宿主（Python，lite-model）─────► adapter(lite-model) ─┘
+lite-agent（C7）──► 把事件映射成中立 Message ──► 同一个核心
+非 Python 宿主 ──HTTP──► REST 壳（§9）──► 同一个核心
+没有存储的宿主 ──► Transcript（§8）──► 同一个核心
+```
+
+依赖方向：核心只用标准库。核心 = `types`、`count`（`CharEstimate`）、`fit`、`steps`、`compaction`、`report`、
+`errors`、`docs/`、`adapters/anthropic`、`adapters/openai`、`transcript/`（不含 `pg/`）、`testing`。
+extra：`adapters/lite_model`（`lite-model`）、`TiktokenCounter`（`tiktoken`）、`transcript/pg/`（`pg`）、`server/`（`server`）；
+核心不 import 它们。C0 的 `sys.modules` 检查就按这份清单。lite-context 不依赖任何 lite 模块。
+
+## 3. 中立类型与 adapter
+
+### 3.1 类型
+
+全部是 frozen dataclass（3.11 可用的写法：`TypeAlias`、`TypeVar`，不用 PEP 695）。
+
+```python
+Text(text: str, extra: Mapping[str, object] = {})
+ToolCall(id: str, name: str, raw_args: str, extra: Mapping[str, object] = {})
+                                 # raw_args verbatim (OpenAI sends a JSON string, possibly malformed);
+                                 # .args() parses on demand and may raise
+ToolResult(call_id: str, content: tuple[Text | Opaque, ...], is_error: bool = False,
+           extra: Mapping[str, object] = {})
+Opaque(kind: str, raw: object, tokens: int | None = None, estimated: bool = True)
+                                 # kind: "image" | "document" | "thinking" | "unknown"
+Part: TypeAlias = Text | ToolCall | ToolResult | Opaque
+
+Message(
+    role: Literal["user", "assistant"],
+    parts: tuple[Part, ...],
+    key: str | None = None,      # the caller's stable id (a DB row id, a seq); needed for Compaction (§6)
+    pinned: bool = False,        # never masked, dropped or summarised away (§5.2)
+    extra: Mapping[str, object] = {},   # fields the core ignores (cache_control, name, content form ...)
+)
+```
+
+- `extra` 放核心不关心、但转回厂商格式时必须原样带上的字段：`cache_control`、OpenAI 的 `name`、content 原来是
+  字符串还是块列表、`content: null` 还是 `""`。核心不读它，只搬运；被 mask 的部分不保留 `extra` 之外的原文。
+- system prompt 和 tool 定义不是 `Message`：作为 `fixed` 文本（或直接给 token 数）传给 `fit()`，计入预算，永不裁剪。
+- `Opaque` 原样保留 adapter 不认识或不该动的内容（图片、PDF、thinking 块、厂商专有块），`raw` 是原始对象，
+  转回去时原样输出。`tokens` 是它的成本，由 adapter 按种类估（图片按尺寸、PDF 按页数，拿不到时用计数器的
+  `opaque()` 默认值，`estimated=True`）；**永远不对 `raw` 跑文本计数**（base64 会被算成几十倍）。报告列出每个
+  估算出来的 `Opaque`。
+- **thinking 块不能改**：Anthropic 要求带 tool_use 的那一轮的签名 thinking 块原样回传。任何步骤都不 mask、不截断
+  `kind="thinking"`；它们只按 lite-agent §6 的规则在最近一次 `Compaction` 之前整体去掉。
+- **配对**：tool call 和它的结果用 `id` / `call_id` 配对。一次 assistant 消息里的多个 call 是一个**批次**，它们的结果
+  可能分在连续几条消息里（OpenAI 每个结果一条 `role: tool`）。§5 的每一步都以整个批次为单位，不拆开。
+- **轮**：一轮从一条带 `Text`、不带 `ToolResult` 的 user 消息开始（人说的话），到下一条这样的消息之前。只装 tool
+  结果的 user 消息不开始新的一轮。`DropOldest`、`plan_compaction` 都用这个定义。
+- **不完整的配对**：最后一个批次的结果还没到（loop 中途调用 `fit()`）是正常的，原样输出。除此之外，没有结果的
+  call、没有 call 的结果都是输入错误：`fit()` 抛 `BrokenPairing`，不猜、不补。
+
+### 3.2 Adapter
+
+一个 adapter 是一对函数：`to_messages(native) -> list[Message]`、`from_messages(list[Message]) -> native`。
+
+| Adapter | 位置 | 说明 |
+| --- | --- | --- |
+| `anthropic` | 核心（只处理 dict，不 import SDK） | Messages API 的 `messages` 数组（system 在 Anthropic 里本来就是单独的参数）：string content、`text` / `tool_use` / `tool_result` 块（`tool_result` 的 content 可以是字符串或块列表，`is_error`）、`cache_control`；其它块（`image`、`document`、`thinking`、`redacted_thinking` …）变 `Opaque` |
+| `openai` | 核心（只处理 dict） | Chat Completions 的完整 `messages` 列表：`system` / `developer` 消息拆出来作为 `fixed` 返回并在转回时放回原位；assistant 的 `tool_calls`（`arguments` 原样进 `raw_args`）、`content: null`；每条 `role: tool` 消息变一条只含一个 `ToolResult` 的 user 消息，转回时还是各自一条 |
+| `lite_model` | extra `lite-model` | lite-model 的 turn 类型；版本跟 workspace 的 lite-model pin |
+| 宿主自有类型 | 宿主里写 | 约 30 行；lite-context 文档里给一个例子 |
+
+规则：**往返无损**。对上表写明的输入范围，`from_messages(to_messages(x)) == x`，`Opaque` 块逐字节原样回来。
+每个 adapter 都有这条性质测试，并且下面每种情况各有一个具名用例：字符串 content 与单个 text 块；`cache_control`
+在块上和消息上；`tool_result` 的 content 是块列表（文字加图片）、`is_error`；格式错误的 `arguments` 字符串；
+`content: null` 与 `""`；一个批次的多条 `role: tool`；`name` 字段；`system` / `developer` 的位置。表外的输入
+（不认识的 role 等）抛 `UnsupportedInput`，不尽力转换。`key` / `pinned` 不在厂商格式里，由调用方在转换后设置
+（`with_keys()` 辅助函数）；pin 一个 call 时它所在的整个批次和结果一起 pin。
+
+## 4. 计数与预算
+
+```python
+class Counter(Protocol):
+    def text(self, s: str) -> int: ...
+    def opaque(self, part: Opaque) -> int: ...       # used when part.tokens is None
+    per_message: int                                 # framing overhead per message
+
+CharEstimate(chars_per_token=3.5, opaque_default=1500, per_message=4)   # default, no dependency
+TiktokenCounter(encoding="o200k_base", ...)                             # extra `tiktoken`
+
+Budget(limit: int, reserve_output: int)   # limit = the model's input window as the caller decides it
+```
+
+- 默认计数器是估算（字符数 / 3.5），与宿主 A 现在的做法一致；宿主 B 可以换成 tiktoken。厂商 SDK 的 count_tokens
+  是一次网络调用，不进核心（§15）。
+- 预算判断用估算，记账用厂商返回的 usage（宿主 A 的决策 D-10 也是这样）。报告里的数字标明是估算。
+- 可用量 = `limit - reserve_output - fixed`。`fixed` 本身就超出时直接 `DoesNotFit`，不做任何裁剪。
+
+## 5. 历史：`fit()`
+
+```python
+fitted = fit(
+    messages,                          # the caller's full history, never mutated
+    budget=Budget(limit=200_000, reserve_output=8_000),
+    fixed=[system_prompt, tools_json], # counted, never cut
+    steps=[TruncateToolResults(max_tokens=2_000), MaskToolResults(keep_last=3), DropOldest()],
+    state=saved_state,                 # optional, from the caller's storage: compaction + cut points (§5.4)
+    counter=CharEstimate(),
+)
+fitted.messages        # what to send this turn
+fitted.state           # store it next to the history; pass it back next call
+fitted.report          # tokens before / after, every action taken, compaction_due
+# raises DoesNotFit(report) when every step has run and it still does not fit
+```
+
+### 5.1 流程
+
+1. 有 `state.compaction` 时先应用它（§6.2）：被覆盖的消息换成一条摘要消息。
+2. 按 `state` 里记下的切点重放上次的削减（§5.4）。
+3. **常驻步骤**（`always=True`，如 `TruncateToolResults`）对每条消息都执行，不看是否超预算。它对同一条消息的结果
+   永远一样，所以不会破坏 prompt cache 的前缀。
+4. 仍超出高水位时，按顺序执行**削减步骤**，每一步都削到低水位（`target`，默认预算的 70%）为止，没超就跳过；
+   新的切点写进返回的 `state`。
+5. 全部执行完仍超预算 → `DoesNotFit`；报告里有每一步做了什么。
+6. 高水位默认 = 预算的 90%。`report.compaction_due` 在第 1–4 步**之后**计算：应用了现有摘要和全部削减、仍超过
+   高水位时为真，提示调用方该写新摘要了（§6）。
+
+### 5.2 不变的规则（每条都有测试）
+
+1. 输入的 `messages` 和 `state` 不被修改；同样的输入得到同样的输出（纯函数）。
+2. 一个批次的 `ToolCall` 和它们的 `ToolResult` 要么都在，要么都不在；mask 只换结果的内容，不删配对。
+   不完整的配对按 §3.1 处理。
+3. `pinned` 的消息永不被 mask、drop 或摘要覆盖。
+4. 最后一轮的人话（最后一条带 `Text`、不带 `ToolResult` 的 user 消息）永不被动。最新的 tool 结果**不受**这条
+   保护：常驻步骤可以截断它，并写进报告；否则一个超大的结果会让每次调用都 `DoesNotFit`。
+5. 报告列出每个被动过的消息（`key`，没有 key 时用位置）、动作和省下的 token；没被列出的消息与输入逐字节相同。
+   这条在运行时检查：每个步骤执行后，`fit()` 比对它的输入和输出，有被改或被删、却不在这个步骤报告里的消息就抛
+   `UnreportedChange`。宿主自己写的步骤同样受这个检查。
+6. 每个占位文本是固定的、写在步骤里的常量，测试逐字比对。
+7. `kind="thinking"` 的 `Opaque` 不被任何步骤改动（§3.1）。
+
+### 5.3 步骤
+
+| 步骤 | 类型 | 做什么 |
+| --- | --- | --- |
+| `TruncateToolResults(max_tokens, keep="head" \| "head_tail")` | 常驻 | 超长的 tool 结果截到上限，结尾加 `[cut: N more characters not shown]` |
+| `MaskToolResults(keep_last=N)` | 削减 | 从最旧的**批次**开始，把批次里每个 tool 结果的内容换成 `[result cleared to save context; call {name} again if you need it]`，最近 N 个批次不动；结果里的图片一并换掉 |
+| `MaskOpaque(keep_last=N)` | 削减 | 旧的 `image` / `document` 块（消息里的，和 tool 结果里的）换成 `[{kind} removed to save context]`（宿主 B 现在对附件的做法）；不碰 `thinking` |
+| `DropOldest(keep_last_turns=N)` | 削减 | 删掉最旧的整轮（§3.1 的定义，所以批次不会被拆开），开头留一条 `[N earlier messages not shown]`。默认不在步骤里，调用方明确要才加 |
+
+宿主可以写自己的步骤（`Step` Protocol：`name`、`always`、`apply(view, need) -> (view, actions)`），同样受 §5.2 约束，
+包括运行时的 `UnreportedChange` 检查；共用的不变量测试以 fixture 的形式提供给宿主。
+
+### 5.4 状态：为什么削减要记下来
+
+`fit()` 是纯函数，只看输入。如果不记下上次削到了哪里，原始历史一旦超过高水位，之后每一轮都会重新削到低水位，
+而历史每轮都在变长，于是每轮都多 mask 一条旧消息，prompt cache 每轮都从那里失效。所以每个削减步骤的结果是一个
+**切点**（"mask 到第几个批次"、"drop 到第几轮"），存在 `ContextState` 里：
+
+```python
+@dataclass(frozen=True)
+class ContextState:
+    compaction: Compaction | None
+    cuts: Mapping[str, Cut]       # step name -> how far it has cut, with the covered keys' digest (§6.2)
+```
+
+- 下一次调用传回 `state`：已有的切点原样重放；只有在重放后仍超过高水位时，切点才往前推。切点只往前，不后退。
+- 调用方把 `state` 存在历史旁边（`to_json()` / `from_json()`，一列 JSON 即可；格式带版本号，不认识的版本报错）。
+  不传 `state` 等于从零开始，结果仍然正确，只是 cache 不稳定。
+- 切点和 `Compaction` 一样带被覆盖消息 key 的摘要值；历史在切点之前被改过时抛 `StaleState`（§6.2）。
+
+## 6. 摘要：`Compaction`
+
+```python
+@dataclass(frozen=True)
+class Compaction:
+    covers_through: str      # key of the last message the summary covers
+    covered_count: int       # how many messages it covers (after the leading pinned prefix)
+    covered_digest: str      # sha256 over the covered messages' keys, in order
+    text: str                # exactly what the model is shown, preamble included
+    provenance: Mapping[str, object]   # role / vendor / model / usage, as the caller's LLM layer reports them
+    created_at: datetime
+```
+
+### 6.1 写摘要
+
+```python
+plan = plan_compaction(messages, state=saved_state, policy=SummaryPolicy(keep_last_turns=4), counter=...)
+# plan.prompt: messages for the summarising call; plan.covers_through: the cut
+reply_text = await my_llm.call(role="compact", messages=plan.prompt)      # the caller's own role layer
+new_state = plan.accept(reply_text, provenance=...)   # raises EmptySummary / TruncatedSummary
+store(new_state)                                      # the caller persists it next to its history
+```
+
+- 便捷函数 `acompact(messages, state, summarize=fn, ...)` 把三步合在一起；`fn` 是调用方给的 async 函数。
+- **覆盖范围**：从历史开头的 pinned 前缀（比如最初的任务说明）之后开始，到切点为止。范围里不能有 pinned 消息：
+  切点最远到下一条 pinned 消息之前，所以 pinned 消息永远留在原来的位置，顺序不变。
+- 切点只落在轮的边界上（§3.1），所以不会拆开批次。后一次压缩从头覆盖，把前一次的摘要也吃进去；被截断或为空的
+  摘要算失败，不能顶替历史。这几条沿用 lite-agent S3b。
+- **`SummaryPolicy` 是可替换的**：怎么数"保留最近几轮"、怎么把历史渲染成给摘要模型的文本（lite-agent 用随机
+  token 的头标、去掉复制进来的头标行、去掉 thinking 块）、前言写什么，都在 policy 里。默认 policy 用本节的规则；
+  lite-agent 在 C7 提供它自己的 policy，从而保持它现有的行为。
+- 需要 `key`：没有 key 的历史不能压缩（报错）。key 只要求在一份历史里唯一，**不要求可比较**（UUID 也行）。
+
+### 6.2 应用摘要
+
+`fit(..., state=s)`，`s.compaction = c`：
+
+1. 找到 `c.covers_through` 的位置；找不到 → `StaleState`。
+2. 从 pinned 前缀之后到这个位置的消息数必须等于 `c.covered_count`，它们 key 的摘要值必须等于 `c.covered_digest`；
+   不相等（切点之前有消息被插入、删除或改了 key）→ `StaleState`。不悄悄套用一个过期的摘要。
+3. 这个位置必须是轮的边界，范围里不能有 pinned 消息；否则 → `StaleState`。
+4. 输出：pinned 前缀原样，然后一条 user 消息（内容就是 `c.text`），然后切点之后的消息。只用最近的一条 `Compaction`。
+
+切点之前的消息**内容**被改过（key 不变）时检查不出来；这是调用方的约定：被摘要覆盖的消息不再修改。要改就丢掉
+`state`，重新压缩。
+
+## 7. 长文档与检索结果：`lite_context.docs`
+
+两个首批宿主各写了一遍的东西。模型调用都由调用方传入。
+
+| 函数 | 做什么 |
+| --- | --- |
+| `split(text, max_tokens, overlap=0.06, prefer="\n")` | 按 token 预算切分，带重叠，尽量切在换行处；每块带起止位置和它前面最近的标题 |
+| `pack(units, budget)` | 把连续的单元（页、段、笔记）按预算分组，不打乱顺序；单个单元超出预算时报 `DoesNotFit`，除非 `split_oversize=True` |
+| `halving(items, call, too_large=pred, min_size=1)` | 对一批 items 调 `call`；`too_large(exc)` 为真时对半拆开再调，到 `min_size` 还不行就抛出 |
+| `reduce_tree(notes, budget, merge)` | 分层 reduce：按预算分组、每组 `merge` 成一条，重复直到只剩一组 |
+| `select(chunks, budget, key=..., score=...)` | 在已排好序的检索结果里按预算取前几条，按 key 去重；报告写明丢了哪些 |
+
+规则：顺序不变；每次 `halving` / `reduce_tree` 的调用次数和分组写进报告；失败不吞掉。
+
+`reduce_tree` 的终止条件：每一轮的条数必须比上一轮少，否则抛 `DoesNotFit`（`merge` 的输出不比输入短，或单条笔记
+本身就超过预算）；每个 `merge` 的输出都要检查是否在预算内；`max_depth`（默认 8）到了还没收敛也抛出。
+
+## 8. `Transcript`：给没有存储的宿主
+
+```python
+t = Transcript(store=InMemoryStore(), id="thread-1")      # or PgStore (extra `pg`)
+seq = t.append([user("...")], expected_seq=t.last_seq)
+fitted = t.project(budget=..., steps=[...])              # latest ContextState + fit()
+reply = my_llm.call(fitted.messages)
+t.append([assistant_from(reply), fitted.state], expected_seq=seq)   # the state is an entry too
+await t.compact(summarize=fn)                            # writes a new ContextState entry when due
+```
+
+- append-only：条目是 `Message` 或 `ContextState`，带单调递增的 `seq`（就是 `key`）；`append(entries, expected_seq)`
+  并发冲突时一个成功一个被拒（`SeqConflict`），一批条目全有或全无。
+- `project()` 是纯投影：同一份条目得到同一份输出。
+- PostgreSQL：数据库和 role `lite_context`，schema `lite_context`；测试只用同一数据库里的 schema
+  `lite_context_test`，URL 来自 `LITECONTEXT_TEST_DATABASE_URL`。表上有拒绝 UPDATE / DELETE 的 trigger（与
+  lite-agent 的 events 表一样）。
+
+## 9. REST 壳
+
+`litecontext serve`（extra `server`，FastAPI），只绑 127.0.0.1:8750，拒绝别的地址；不做鉴权，与 lite-agent 的
+HTTP 壳一样，等有宿主要从别的机器访问时再定。壳里没有逻辑：解析请求、调库、序列化。
+
+| 端点 | 状态 | 对应 |
+| --- | --- | --- |
+| `POST /v1/fit` | 无状态 | `fit()`；`format: anthropic \| openai \| neutral` 决定 messages 的格式 |
+| `POST /v1/compaction/plan` / `POST /v1/compaction/accept` | 无状态 | §6.1 的前后两步：返回写摘要的 prompt；交回摘要文本，返回 `Compaction` |
+| `POST /v1/docs/split`、`/v1/docs/pack`、`/v1/docs/select` | 无状态 | §7 里不调模型的三个 |
+| `POST /v1/transcripts`、`POST /v1/transcripts/{id}/entries`、`POST /v1/transcripts/{id}/project` | 有状态（需要 `pg`） | §8 |
+| `POST /v1/transcripts/{id}/compaction/plan` / `.../compaction/accept` | 有状态 | §8 的 `compact()` 拆成两步：服务返回 prompt，客户端写好摘要交回，服务追加新的 `ContextState` 条目 |
+
+`halving` / `reduce_tree` 需要回调，不在 REST 里。服务端自己调 role 写摘要（需要 lite-model 和凭证）是以后的选项（§15）。
+
+## 10. 配置
+
+库的参数都在代码里传。REST 壳的配置来自环境变量，前缀 `LITECONTEXT_`（`DATABASE_URL`、`HOST`、`PORT`）；
+`.env.example` 是模板，`.env` 不进 git。
+
+## 11. 测试
+
+- pytest，`tests/conftest.py` 拒绝一切 socket（PostgreSQL 测试除外，只连 `LITECONTEXT_TEST_DATABASE_URL`）。
+- §5.2 的每条规则至少一个有名字的测试；adapter 有往返性质测试（hypothesis）。
+- 断言具体内容：输出的每条消息、报告里的每个动作和数字，不只是"没报错"。
+- CI：ruff、ruff format、mypy strict、pytest，在 Python 3.11 和 3.12 上各跑一遍。
+- 效果测量（C4 起）：宿主接入前后，记录同一批真实调用的输入 token、超窗口失败次数、prompt cache 命中；
+  masking 和摘要的质量对比用 lite-eval 跑（§15）。
+
+## 12. 与其它项目的关系
+
+| 项目 | 关系 |
+| --- | --- |
+| 宿主 A（Python 3.12，uv，自有 LLM 层和类型，Temporal 里的 tool loop） | C4：tool loop 每一步先 `fit()`（`TruncateToolResults` + `MaskToolResults`），代替现在只在产生时截断；纯函数，留在 workflow 里；摘要走一个新的 activity。文档的按页分组和对半重试换成 §7 |
+| 宿主 B（Python 3.11，pip，Anthropic 格式的 dict，chat 历史在 PostgreSQL 里由 TypeScript 服务持有） | C4：chat 请求进 Python 时先 `fit()`；`ContextState` 存在 thread 上（宿主自己的 migration）；文档的切分、对半重试、分层 reduce 换成 §7 |
+| lite-agent | C7：依赖 lite-context，把事件映射成中立 `Message`，它的 `SummaryCompactor` 和投影里的遮盖规则改用 lite-context。需要改它的设计（规则 8：lite-model 是唯一的 lite 依赖） |
+| lite-model | 不依赖。`lite_model` adapter 是 extra，版本跟 workspace pin |
+| lite-rag、lite-mem | 不依赖。lite-rag 负责检索和排序，§7 的 `select` 只在它排好的结果里挑 |
+| lite-eval | C4 之后用它对比 masking 和摘要的质量（extra `eval`） |
+
+安装方式：GitHub Release wheel（与 lite-model、lite-agent 一样）。uv 宿主在 `[tool.uv.sources]` 写 wheel URL；
+pip 宿主在 requirements 里写 `lite-context @ <wheel URL>`。
+
+## 13. 项目结构
+
+```
+lite-context/
+  src/lite_context/
+    types.py, count.py, fit.py, steps.py, compaction.py, report.py, errors.py
+    adapters/      anthropic.py, openai.py, lite_model.py (extra)
+    docs/          split.py, pack.py, halving.py, reduce.py, select.py
+    transcript/    store.py, memory.py, pg/ (extra `pg`)
+    server/        app.py (extra `server`)
+    cli.py         litecontext serve | migrate
+    testing.py     invariant fixtures for hosts' own steps
+  tests/
+  docs/lite-context-design.md
+```
+
+## 14. 阶段与验收
+
+§5.2、§6 的每条规则都要对应到至少一个有名字的测试；阶段收尾时列出"规则 → 测试"的对照。
+
+每个阶段收尾都按 AGENTS.md Workflow 第 4 步执行：`/simplify`，然后 Codex 只读 review，然后修复（否决的
+写在本节的阶段记录里），最后重跑全部检查。
+
+| 阶段 | 内容 | 验收 |
+| --- | --- | --- |
+| S0 | 仓库、设计文档、AGENTS.md / CLAUDE.md / README、项目 KB、workspace `AGENTS.md` 登记、端口 8750 登记 | 本文经 owner 确认；Codex 对设计的 review 已处理 |
+| C0 | 骨架：pyproject（uv、hatchling、ruff、mypy strict、pytest、`requires-python >=3.11`）、CI（3.11 + 3.12）、拒绝 socket 的 conftest；§3 的类型和 `anthropic` / `openai` adapter；§4 的计数器和预算；`Report`、`DoesNotFit` | 两个版本上 ruff、mypy、pytest 全绿；adapter 往返性质测试加 §3.2 列出的每个具名用例；表外输入抛 `UnsupportedInput`；`Opaque` 的估算按种类且不对 `raw` 计数；核心 import 时没有第三方模块（测试按 §2 的清单检查 `sys.modules`）；`fixed` 超预算直接 `DoesNotFit` |
+| C1 | `fit()` 与 §5.3 的四个步骤、高低水位、`ContextState` 与切点（§5.4）、§6 的 `plan_compaction` / `accept` / `acompact`、`SummaryPolicy` 与应用摘要 | §5.2 七条规则各有测试（含 `UnreportedChange` 抓住一个故意不报告的自写步骤）；同一输入两次 `fit()` 结果相同；带 `state` 连续调用 20 轮、历史每轮变长：被改动的旧消息只在越过高水位的那几轮变化，其余轮次与上一轮的输出前缀逐字节相同（cache 稳定性）；不完整配对的三种情况（最后批次未完成放行、缺结果和缺 call 抛 `BrokenPairing`）；`keep_last` 按批次计数；`DropOldest` 不拆开以 tool 结果开头的轮；超大的最新 tool 结果被常驻步骤截断而不是 `DoesNotFit`；thinking 块不被任何步骤改动；`StaleState` 的三种情况（找不到切点、数量或摘要值不符、切点不在轮边界）；摘要后原 messages 不变、输出以摘要开头；后一次压缩吃进前一次；截断或空摘要失败；切点不拆配对、不越过 pinned 消息、pinned 前缀留在摘要之前；找不到 `covers_through` 报错；`testing.py` 的 fixture 能套在一个宿主自写的步骤上 |
+| C2 | §7：`split`、`pack`、`halving`、`reduce_tree`、`select` | 用两个首批宿主现有实现的行为写测试（重叠比例、切在换行、单元超预算报错、对半到 `min_size` 后抛出、分层次数、去重）；`reduce_tree` 在 `merge` 不缩短输入、单条超预算、到 `max_depth` 时都抛出而不是死循环；调用方传入的 fake 记录每次调用的输入，断言分组和顺序 |
+| C3 | 发布 v0.1.0 release wheel | 一个新的 3.11 pip 环境和一个 3.12 uv 项目都能从 wheel 安装并跑通 README 的例子 |
+| C4 | 宿主 A、B 同时接入（各自仓库里做，各自收尾）；lite-context 这边只修接入中发现的问题 | 两个宿主的全部测试通过；接入前后同一批调用的输入 token、超窗口失败、cache 命中写进 KB；宿主 B 的 `ContextState` 持久化有迁移和测试；**通过条件**：用接入前录下的一批真实请求重放，超窗口失败为 0，输入 token 不高于接入前，两个宿主各自的测试全绿 |
+| C5 | §8：`Transcript`、`InMemoryStore`、`PgStore`（extra `pg`）、`litecontext migrate` | append-only（trigger 拒绝 UPDATE / DELETE）；并发 append 一个成功一个被拒；内存和 PG 的投影相同；跨进程读回后投影相同 |
+| C6 | §9 REST 壳（extra `server`） | 每个端点与库函数的输出逐字段相同（同一组 fixture 跑两遍）；只绑 127.0.0.1；请求体超限被拒 |
+| C7 | lite-agent 改用 lite-context（在 lite-agent 仓库里，先 plan mode）：它提供自己的 `SummaryPolicy`（轮的计法、渲染、头标处理） | lite-agent 的全部压缩测试不改一行仍然通过；做不到的地方先在 lite-context 补能力，或在 lite-agent 的阶段记录里逐条写明为什么改测试；它的设计 §6 和规则 8 同步更新 |
+| 按需 | token 级压缩步骤、服务端摘要、tiktoken 以外的计数器、async 计数器 | — |
+
+### 阶段记录
+
+（每个阶段收尾时追加：做了什么、规则 → 测试对照、Codex 的发现与处理。）
+
+- **S0（2026-11-26）**：仓库、本文初稿、AGENTS.md / CLAUDE.md / README、项目 KB、workspace 登记、端口 8750。
+  Codex 不可用（账户额度用完，到 2026-12-18 才恢复），改由一个不带本文作者结论的 Claude 子代理做对抗式设计 review，
+  12 条发现全部成立、全部采纳：
+  1. 纯函数 `fit()` 加高低水位不能让 cache 稳定 → 加 `ContextState` 和切点（§5.4）。
+  2. "轮"按 user 消息切会拆开以 tool 结果开头的批次 → 重新定义轮（§3.1）。
+  3. "最后一条 user 消息不动"与常驻截断冲突 → 改为只保护最后一轮的人话（§5.2-4）。
+  4. 中立类型装不下厂商格式的全部字段 → `raw_args`、结果内容可含图片、`extra`、写明往返范围和具名用例（§3）。
+  5. mask thinking 块会被 Anthropic 拒绝 → thinking 不被任何步骤改动（§3.1、§5.2-7）。
+  6. `Opaque` 的估算 → 按种类估、不对 `raw` 计数、报告标明（§3.1）。
+  7. key 不可比较、历史被改后摘要过期、pinned 在覆盖范围里 → `covered_count` + 摘要值 + `StaleState`、覆盖范围不含 pinned（§6）。
+  8. 不完整配对没定义 → §3.1 写明，`BrokenPairing`；`keep_last` 按批次。
+  9. 自写步骤能悄悄丢内容 → 运行时 `UnreportedChange` 检查（§5.2-5）。
+  10. `reduce_tree` 可能不收敛 → 终止条件（§7）。
+  11. C7 与 lite-agent 的摘要规则不一致、C4 没有通过条件 → `SummaryPolicy` 可替换、C4 写明通过条件（§6.1、§14）。
+  12. 零碎矛盾（`expected_seq`、REST 缺压缩端点、测试 schema、核心模块清单、`compaction_due` 的计算时机）→ 逐条改正。
+
+## 15. 待确认
+
+- **厂商的 count_tokens**：宿主 B 对 Claude 用 SDK 的 `messages.count_tokens`（一次网络调用）。核心的 `Counter`
+  是同步的；要不要加一个 async 计数器，或让宿主先算好再传 `Opaque.tokens` / 预算，C4 接入时定。
+- **摘要质量怎么测**：masking 和摘要哪个更好，公开结果是 reported。C4 之后用 lite-eval 在宿主的真实任务上对比，
+  测之前不在文档里推荐其中一个做默认。
+- **服务端摘要**：REST 模式下由服务自己调 lite-model role 写摘要（§0 里"以后的可选项"）。有非 Python 宿主要用时再做。
+- **token 级压缩**（LLMLingua 一类）：需要本地小模型，适合长文档不适合历史；有宿主要用时作为 §7 的可选步骤。
+- **Python 3.11 的下限**：宿主 B 升到 3.12 后，是否提到 3.12 与其它 lite 模块一致。
+- **项目 KB 的位置**：`KB/projects/lite-context/`（S0 创建）。

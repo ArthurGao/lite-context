@@ -26,3 +26,4 @@ htmlcov/
 
 # Agent workspaces (superpowers plan ledgers)
 .superpowers/
+.hypothesis/

@@ -24,8 +24,9 @@ If a change must contradict the design, update the design in the same change and
 
 ## Current stage
 
-**S0 (2026-11-26): repository, design draft, agent guides, project KB.** No code yet. Next: C0 (design §14) —
-after the owner confirms the design.
+**S0 done 2026-11-26**: repository, design, agent guides, project KB. **C0 done 2026-11-26**: the neutral types,
+the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (design §3, §4). Next: C1 — `fit()`,
+the steps, `ContextState`, compaction (design §5, §6).
 
 ## Rules
 
@@ -62,14 +63,14 @@ after the owner confirms the design.
 
 ## Tech stack
 
-Python ≥ 3.11 (CI 3.11 + 3.12), uv, hatchling, pytest (+ pytest-asyncio, hypothesis), ruff, mypy (strict).
+Python ≥ 3.11 (CI 3.11 + 3.12), uv (uv_build), pytest (+ hypothesis; pytest-asyncio from C1), ruff, mypy (strict).
 Extras: `lite-model`, `tiktoken`, `pg` (psycopg 3), `server` (FastAPI), `eval`.
 
 ## Commands
 
-From C0 on:
-
 ```
+uv run pytest                    # C0-C4; from C5 `uv run --env-file .env pytest`
+uv run --python 3.11 --isolated --with-editable . --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
 uv run --env-file .env pytest    # everything; PostgreSQL tests need LITECONTEXT_TEST_DATABASE_URL (from C5)
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv run litecontext serve          # the REST shell, loopback :8750 (extra `server`, from C6)

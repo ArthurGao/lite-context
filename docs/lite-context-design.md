@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C0 未开始（2026-11-26 立项，本文是初稿）。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C0 完成（2026-11-26）：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -90,10 +90,13 @@ Text(text: str, extra: Mapping[str, object] = {})
 ToolCall(id: str, name: str, raw_args: str, extra: Mapping[str, object] = {})
                                  # raw_args verbatim (OpenAI sends a JSON string, possibly malformed);
                                  # .args() parses on demand and may raise
-ToolResult(call_id: str, content: tuple[Text | Opaque, ...], is_error: bool = False,
-           extra: Mapping[str, object] = {})
-Opaque(kind: str, raw: object, tokens: int | None = None, estimated: bool = True)
+ToolResult(call_id: str, content: tuple[Text | Opaque, ...],
+           is_error: bool | None = None,             # None: the format had no error flag
+           content_form: ContentForm | None = None, extra: Mapping[str, object] = {})
+Opaque(kind: str, raw: object, tokens: int | None = None,
+       text: str | None = None, pages: int | None = None)
                                  # kind: "image" | "document" | "thinking" | "unknown"
+ContentForm = Literal["string", "list", "null", "absent"]   # the form a vendor's content had
 Part: TypeAlias = Text | ToolCall | ToolResult | Opaque
 
 Message(
@@ -101,16 +104,23 @@ Message(
     parts: tuple[Part, ...],
     key: str | None = None,      # the caller's stable id (a DB row id, a seq); needed for Compaction (§6)
     pinned: bool = False,        # never masked, dropped or summarised away (§5.2)
-    extra: Mapping[str, object] = {},   # fields the core ignores (cache_control, name, content form ...)
+    content_form: ContentForm | None = None,
+    extra: Mapping[str, object] = {},   # fields the core ignores (cache_control, name ...)
 )
 ```
 
-- `extra` 放核心不关心、但转回厂商格式时必须原样带上的字段：`cache_control`、OpenAI 的 `name`、content 原来是
-  字符串还是块列表、`content: null` 还是 `""`。核心不读它，只搬运；被 mask 的部分不保留 `extra` 之外的原文。
+- `extra` 放核心不关心、但转回厂商格式时必须原样带上的字段：`cache_control`、OpenAI 的 `name`、`tool_calls: []`、
+  `function` 里多出来的字段。核心不读它，只搬运；被 mask 的部分不保留 `extra` 之外的原文。
+- `content_form` 记下 content 原来的形式（字符串、列表、`null`、没有这个键），是有类型的字段而不是 `extra` 里的
+  约定键，C1 的步骤替换内容时用 `dataclasses.replace` 保留它。为 `None`（手工构造）时，单个无 `extra` 的 `Text`
+  输出成字符串，其它输出成列表。
+- **共享而不复制**：adapter 不深拷贝。`Opaque.raw` 和 `extra` 里的嵌套对象（`cache_control` 等）在输入、中立消息和
+  输出之间是同一个对象；这是有意的（大块的图片、PDF 不复制）。约定：调用方和 lite-context 都不改动它们，要改就先
+  复制。lite-context 自己从不改动输入（每个 adapter 测试都检查输入没变）。
 - system prompt 和 tool 定义不是 `Message`：作为 `fixed` 文本（或直接给 token 数）传给 `fit()`，计入预算，永不裁剪。
 - `Opaque` 原样保留 adapter 不认识或不该动的内容（图片、PDF、thinking 块、厂商专有块），`raw` 是原始对象，
-  转回去时原样输出。`tokens` 是它的成本，由 adapter 按种类估（图片按尺寸、PDF 按页数，拿不到时用计数器的
-  `opaque()` 默认值，`estimated=True`）；**永远不对 `raw` 跑文本计数**（base64 会被算成几十倍）。报告列出每个
+  转回去时原样输出。`tokens` 是它的成本；调用方知道时直接填上，否则由计数器按种类和 adapter 在转换时取出的中立度量估（§4）：
+  `text`（thinking 块、文本文档自己的文字）、`pages`（PDF 页数，转换时数一次）。`tokens is None` 就是"估算的"；**永远不对 `raw` 跑文本计数**（base64 会被算成几十倍）。报告列出每个
   估算出来的 `Opaque`。
 - **thinking 块不能改**：Anthropic 要求带 tool_use 的那一轮的签名 thinking 块原样回传。任何步骤都不 mask、不截断
   `kind="thinking"`；它们只按 lite-agent §6 的规则在最近一次 `Compaction` 之前整体去掉。
@@ -127,8 +137,8 @@ Message(
 
 | Adapter | 位置 | 说明 |
 | --- | --- | --- |
-| `anthropic` | 核心（只处理 dict，不 import SDK） | Messages API 的 `messages` 数组（system 在 Anthropic 里本来就是单独的参数）：string content、`text` / `tool_use` / `tool_result` 块（`tool_result` 的 content 可以是字符串或块列表，`is_error`）、`cache_control`；其它块（`image`、`document`、`thinking`、`redacted_thinking` …）变 `Opaque` |
-| `openai` | 核心（只处理 dict） | Chat Completions 的完整 `messages` 列表：`system` / `developer` 消息拆出来作为 `fixed` 返回并在转回时放回原位；assistant 的 `tool_calls`（`arguments` 原样进 `raw_args`）、`content: null`；每条 `role: tool` 消息变一条只含一个 `ToolResult` 的 user 消息，转回时还是各自一条 |
+| `anthropic` | 核心（只处理 dict，不 import SDK） | Messages API 的 `messages` 数组（system 在 Anthropic 里本来就是单独的参数）：string content、`text` / `tool_use`（`input` 必须是能原样往返的纯 JSON 对象：没有非字符串键、tuple、NaN / Infinity）/ `tool_result` 块（`tool_result` 的 content 可以是字符串或块列表，`is_error`）、`cache_control`；其它块（`image`、`document`、`thinking`、`redacted_thinking` …）变 `Opaque` |
+| `openai` | 核心（只处理 dict） | Chat Completions 的完整 `messages` 列表：`system` / `developer` 消息拆出来作为 `fixed` 返回并在转回时放回原位；assistant 的 `tool_calls`（只接受 `type: "function"`；`arguments` 原样进 `raw_args`；`tool_calls` 为 `null` 或 `[]` 时原样保留，SDK 的 `model_dump()` 会给出 `null`）、`content: null` 或没有 content；每条 `role: tool` 消息变一条只含一个 `ToolResult` 的 user 消息，转回时还是各自一条 |
 | `lite_model` | extra `lite-model` | lite-model 的 turn 类型；版本跟 workspace 的 lite-model pin |
 | 宿主自有类型 | 宿主里写 | 约 30 行；lite-context 文档里给一个例子 |
 
@@ -138,6 +148,10 @@ Message(
 `content: null` 与 `""`；一个批次的多条 `role: tool`；`name` 字段；`system` / `developer` 的位置。表外的输入
 （不认识的 role 等）抛 `UnsupportedInput`，不尽力转换。`key` / `pinned` 不在厂商格式里，由调用方在转换后设置
 （`with_keys()` 辅助函数）；pin 一个 call 时它所在的整个批次和结果一起 pin。
+
+OpenAI 的 tool 消息没有错误标记，`ToolResult.is_error` 转成 OpenAI 格式时不出现。OpenAI adapter 的
+`Converted.fixed_texts()` 把 system / developer 消息变成 `fit(fixed=...)` 要的文本。一条中立 user 消息里混着
+tool 结果和别的内容时，OpenAI 输出按原顺序分段：每个结果一条 tool 消息，每段其它内容一条 user 消息。
 
 ## 4. 计数与预算
 
@@ -155,6 +169,16 @@ Budget(limit: int, reserve_output: int)   # limit = the model's input window as 
 
 - 默认计数器是估算（字符数 / 3.5），与宿主 A 现在的做法一致；宿主 B 可以换成 tiktoken。厂商 SDK 的 count_tokens
   是一次网络调用，不进核心（§15）。
+- `tokens` 不为 `None` 时直接用，计数器不被调用（`count_message` 里判断，每个 `Counter` 不用各自记得）。否则
+  `CharEstimate.opaque()` 只看 `kind` 和中立度量，从不读 `raw`：`image` 1600；有 `pages` 时页数 × 2000；有 `text`
+  时数文字；其它（`redacted_thinking`、读不出页数的 PDF、未知块）用默认值 1500。几个数都是构造参数。
+  adapter 取度量：Anthropic 的 `thinking` 文本、文本来源的 `document`、base64 PDF（数 `/Type /Page`）；OpenAI 的
+  `file` 部分里 `data:application/pdf;base64,` 开头的 `file_data`。页数是数 `/Type /Page` 的估计：页对象放在压缩
+  对象流里（PDF 1.5 的 `ObjStm`）时数不到、落到默认值；增量更新过的文件可能多数。都只影响估算，不影响内容。
+- `CharEstimate` 的参数必须为正（`chars_per_token`）或不为负（其它）；`fixed` 里的 token 数必须是非负的 int
+  （`bool` 不算），否则 `ValueError`。
+- `TiktokenCounter` 推迟到 C4、宿主 B 接入时做：tiktoken 第一次用时从网络下载编码文件，和"测试不联网"冲突，需要
+  先定下编码文件怎么随包提供；宿主 B 也可以直接实现 `Counter` 协议。
 - 预算判断用估算，记账用厂商返回的 usage（宿主 A 的决策 D-10 也是这样）。报告里的数字标明是估算。
 - 可用量 = `limit - reserve_output - fixed`。`fixed` 本身就超出时直接 `DoesNotFit`，不做任何裁剪。
 
@@ -361,7 +385,7 @@ pip 宿主在 requirements 里写 `lite-context @ <wheel URL>`。
 lite-context/
   src/lite_context/
     types.py, count.py, fit.py, steps.py, compaction.py, report.py, errors.py
-    adapters/      anthropic.py, openai.py, lite_model.py (extra)
+    adapters/      _common.py, anthropic.py, openai.py, lite_model.py (extra)
     docs/          split.py, pack.py, halving.py, reduce.py, select.py
     transcript/    store.py, memory.py, pg/ (extra `pg`)
     server/        app.py (extra `server`)
@@ -381,7 +405,7 @@ lite-context/
 | 阶段 | 内容 | 验收 |
 | --- | --- | --- |
 | S0 | 仓库、设计文档、AGENTS.md / CLAUDE.md / README、项目 KB、workspace `AGENTS.md` 登记、端口 8750 登记 | 本文经 owner 确认；Codex 对设计的 review 已处理 |
-| C0 | 骨架：pyproject（uv、hatchling、ruff、mypy strict、pytest、`requires-python >=3.11`）、CI（3.11 + 3.12）、拒绝 socket 的 conftest；§3 的类型和 `anthropic` / `openai` adapter；§4 的计数器和预算；`Report`、`DoesNotFit` | 两个版本上 ruff、mypy、pytest 全绿；adapter 往返性质测试加 §3.2 列出的每个具名用例；表外输入抛 `UnsupportedInput`；`Opaque` 的估算按种类且不对 `raw` 计数；核心 import 时没有第三方模块（测试按 §2 的清单检查 `sys.modules`）；`fixed` 超预算直接 `DoesNotFit` |
+| C0 | 骨架：pyproject（uv、uv_build、ruff、mypy strict、pytest、`requires-python >=3.11`）、CI（3.11 + 3.12）、拒绝 socket 的 conftest；§3 的类型和 `anthropic` / `openai` adapter；§4 的计数器和预算；`Report`、`DoesNotFit` | 两个版本上 ruff、mypy、pytest 全绿；adapter 往返性质测试加 §3.2 列出的每个具名用例；表外输入抛 `UnsupportedInput`；`Opaque` 的估算按种类且不对 `raw` 计数；核心 import 时没有第三方模块（测试按 §2 的清单检查 `sys.modules`）；`fixed` 超预算直接 `DoesNotFit` |
 | C1 | `fit()` 与 §5.3 的四个步骤、高低水位、`ContextState` 与切点（§5.4）、§6 的 `plan_compaction` / `accept` / `acompact`、`SummaryPolicy` 与应用摘要 | §5.2 七条规则各有测试（含 `UnreportedChange` 抓住一个故意不报告的自写步骤）；同一输入两次 `fit()` 结果相同；带 `state` 连续调用 20 轮、历史每轮变长：被改动的旧消息只在越过高水位的那几轮变化，其余轮次与上一轮的输出前缀逐字节相同（cache 稳定性）；不完整配对的三种情况（最后批次未完成放行、缺结果和缺 call 抛 `BrokenPairing`）；`keep_last` 按批次计数；`DropOldest` 不拆开以 tool 结果开头的轮；超大的最新 tool 结果被常驻步骤截断而不是 `DoesNotFit`；thinking 块不被任何步骤改动；`StaleState` 的三种情况（找不到切点、数量或摘要值不符、切点不在轮边界）；摘要后原 messages 不变、输出以摘要开头；后一次压缩吃进前一次；截断或空摘要失败；切点不拆配对、不越过 pinned 消息、pinned 前缀留在摘要之前；找不到 `covers_through` 报错；`testing.py` 的 fixture 能套在一个宿主自写的步骤上 |
 | C2 | §7：`split`、`pack`、`halving`、`reduce_tree`、`select` | 用两个首批宿主现有实现的行为写测试（重叠比例、切在换行、单元超预算报错、对半到 `min_size` 后抛出、分层次数、去重）；`reduce_tree` 在 `merge` 不缩短输入、单条超预算、到 `max_depth` 时都抛出而不是死循环；调用方传入的 fake 记录每次调用的输入，断言分组和顺序 |
 | C3 | 发布 v0.1.0 release wheel | 一个新的 3.11 pip 环境和一个 3.12 uv 项目都能从 wheel 安装并跑通 README 的例子 |
@@ -410,6 +434,45 @@ lite-context/
   10. `reduce_tree` 可能不收敛 → 终止条件（§7）。
   11. C7 与 lite-agent 的摘要规则不一致、C4 没有通过条件 → `SummaryPolicy` 可替换、C4 写明通过条件（§6.1、§14）。
   12. 零碎矛盾（`expected_seq`、REST 缺压缩端点、测试 schema、核心模块清单、`compaction_due` 的计算时机）→ 逐条改正。
+- **C0（2026-11-26）**：`pyproject`（uv_build，与其它 lite 模块一致，原文写的 hatchling 改掉；`requires-python
+  >=3.11,<3.13`，ruff `target-version = py311`，mypy `python_version = 3.11`）、CI（3.11 + 3.12 矩阵）、
+  `types` / `count` / `report` / `errors`、`adapters/anthropic`、`adapters/openai`。与本文的偏差：`Opaque` 的估算放在
+  计数器里而不是 adapter（§3.1、§4 已改；收尾时又改回由 adapter 取度量，见下面的 /simplify）；`TiktokenCounter`
+  推迟到 C4（§4）。
+  规则 → 测试：
+  - 往返无损：`test_adapter_anthropic.py::test_every_supported_conversation_round_trips`、
+    `test_adapter_openai.py::test_every_supported_conversation_round_trips`（hypothesis），加 §3.2 每个具名用例
+    （字符串与单个 text 块、`cache_control`、tool_result 的三种 content 和 `is_error`、格式错误的 `arguments`、
+    `content: null` / `""` / 没有键、并行批次的多条 tool 消息、`name` 和未知键、system / developer 的位置）。
+  - 表外输入被拒：两个 adapter 的 `test_input_outside_the_supported_range_is_refused`。
+  - `Opaque` 原样回来：`test_blocks_the_core_does_not_handle_become_opaque_and_come_back_unchanged`（同一个对象）。
+  - 按种类估、不对 `raw` 计数：`test_count.py` 的 image / thinking / 文本文档 / PDF / 未知块五条。
+  - 核心零依赖：`test_core_imports.py`（子进程里按 §2 清单 import，检查 `sys.modules`）。
+  - `fixed` 超预算：`test_fixed_content_over_the_budget_does_not_fit_before_any_cutting`。
+  - 测试不联网：`test_no_network.py`。
+  见红：新测试先在空包上全部失败；之后逐个破坏被测代码确认关键测试变红（核心多 import 一个第三方模块、关掉拒绝
+  socket 的 fixture、Anthropic 不记录列表形式、PDF 页数恒为 0、OpenAI 提前解析 `arguments`），再恢复。
+  `/simplify`（四个角度的子代理）：采纳——计数器不再读厂商的块结构，adapter 在转换时取出 `Opaque.text` /
+  `Opaque.pages`（PDF 只解码一次）；content 形式从 `extra` 里带前缀的约定键改成有类型的 `content_form`，
+  `is_error` 改成 `bool | None`，`tool_calls: []` 和 `function` 的多余字段原样留在 `extra`，去掉命名空间键；两个
+  adapter 的重复（纯文本判断、text 块、opaque、字符串或列表）收进 `adapters/_common.py`；加 `fixed_texts()`；
+  `Opaque.estimated` 删掉（`tokens is None` 即估算）；OpenAI 输出混合内容时保持顺序；`Report` 里 C1 才用的字段
+  和 `Action` 删掉，C1 再加。跳过——计数结果缓存（C1 的 `fit()` 要按条累加而不是每删一条重数一遍，记在这里给 C1）；
+  `tool_use` 的 input 每次 json 往返（有大 input 的宿主时再说）。新加的测试（度量、顺序、`tool_calls: []`、
+  `fixed_texts`、`tokens` 不问计数器）都用破坏被测代码的方式见过红。
+  代码 review：Codex 不可用，由一个子代理对抗式 review 代替。6 条发现全部成立、全部修复，回归测试先红后绿：
+  1. Anthropic `tool_use.input` 有非字符串键、tuple、NaN 时被接受却回不来 → `allow_nan=False` 并核对 `loads(dumps(x)) == x`，
+     不等就 `UnsupportedInput`（`test_tool_use_input_that_would_not_come_back_equal_is_refused`）。
+  2. OpenAI 没有 `type` 的 tool call 输出时被补上 `type` → 只接受 `type: "function"`
+     （`test_a_tool_call_that_is_not_a_function_call_is_refused`）。
+  3. 输出和输入共享嵌套对象 → 写进 §3.1 的约定（有意不深拷贝）。
+  4. SDK 的 `tool_calls: null` 被拒 → 接受并原样保留（`test_the_sdk_shape_with_tool_calls_none_survives`）。
+  5. 性质测试的生成器漏了几个具名情况 → 补上（浮点数、message 和 tool_use 上的额外字段、document / redacted /
+     未知块、`tool_calls` 的四种形式、`function` 的多余字段、`name`、tool 内容里的图片和文件、`refusal`）；
+     额外用 3000 个例子各跑了一遍，没有失败。
+  6. `CharEstimate`、`Budget` 接受不可能的数 → 构造时和 `available()` 里校验（两条参数化测试）。
+  只记录不改：`restore` 在手工构造的 `extra` 与核心字段同名时让核心字段赢（adapter 自己产生的 `extra` 不会同名）；
+  `Message` 因为 `extra` 是 dict 而不能 hash（C1 若需要再说）；PDF 页数估计的局限（§4）。
 
 ## 15. 待确认
 

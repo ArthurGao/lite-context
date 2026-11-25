@@ -20,3 +20,19 @@ class DoesNotFit(LiteContextError):
 class UnsupportedInput(LiteContextError):
     """Input outside an adapter's documented range (design §3.2): refused, never converted
     on a best-effort basis."""
+
+
+class BrokenPairing(LiteContextError):
+    """A tool call without its result or a result without its call (design §3.1)."""
+
+
+class StaleState(LiteContextError):
+    """A `ContextState` that no longer matches the history it is given (design §5.4, §6.2)."""
+
+
+class UnreportedChange(LiteContextError):
+    """A step changed, removed or added a message it did not report (design §5.2 rule 5)."""
+
+
+class ProtectedChange(LiteContextError):
+    """A step touched a pinned message, the last human turn or a thinking block (§5.2)."""

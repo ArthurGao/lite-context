@@ -25,8 +25,9 @@ If a change must contradict the design, update the design in the same change and
 ## Current stage
 
 **S0 done 2026-11-26**: repository, design, agent guides, project KB. **C0 done 2026-11-26**: the neutral types,
-the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (design §3, §4). Next: C1 — `fit()`,
-the steps, `ContextState`, compaction (design §5, §6).
+the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (design §3, §4). **C1a done
+2026-11-26**: `fit()`, the four steps, `ContextState` with cuts by position, the run-time checks after every step,
+`testing.check_step` (design §5). Next: C1b — compaction (design §6).
 
 ## Rules
 
@@ -69,7 +70,7 @@ Extras: `lite-model`, `tiktoken`, `pg` (psycopg 3), `server` (FastAPI), `eval`.
 ## Commands
 
 ```
-uv run pytest                    # C0-C4; from C5 `uv run --env-file .env pytest`
+uv run pytest                    # C0-C4 (about 7 s: tests/test_growth.py runs 150 random histories); from C5 with --env-file .env
 uv run --python 3.11 --isolated --with-editable . --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
 uv run --env-file .env pytest    # everything; PostgreSQL tests need LITECONTEXT_TEST_DATABASE_URL (from C5)
 uv run ruff check && uv run ruff format --check && uv run mypy

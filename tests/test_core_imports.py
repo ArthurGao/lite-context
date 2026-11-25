@@ -13,6 +13,11 @@ CORE = [
     "lite_context.adapters",
     "lite_context.adapters.anthropic",
     "lite_context.adapters.openai",
+    "lite_context.structure",
+    "lite_context.steps",
+    "lite_context.state",
+    "lite_context.fit",
+    "lite_context.testing",
 ]
 
 PROBE = """

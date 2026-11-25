@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C0 完成（2026-11-26）：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C1a 完成（2026-11-26）：`fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -129,7 +129,9 @@ Message(
 - **轮**：一轮从一条带 `Text`、不带 `ToolResult` 的 user 消息开始（人说的话），到下一条这样的消息之前。只装 tool
   结果的 user 消息不开始新的一轮。`DropOldest`、`plan_compaction` 都用这个定义。
 - **不完整的配对**：最后一个批次的结果还没到（loop 中途调用 `fit()`）是正常的，原样输出。除此之外，没有结果的
-  call、没有 call 的结果都是输入错误：`fit()` 抛 `BrokenPairing`，不猜、不补。
+  call、没有 call 的结果、同一个 call 的第二个结果都是输入错误：`fit()` 抛 `BrokenPairing`，不猜、不补。一个批次
+  还有 call 没回答时，下一条消息必须是带 tool 结果的消息（两家 API 都这样要求），所以批次不会被一句人话从中间
+  隔开，按轮切也就不会拆开批次。
 
 ### 3.2 Adapter
 
@@ -229,31 +231,61 @@ fitted.report          # tokens before / after, every action taken, compaction_d
 
 | 步骤 | 类型 | 做什么 |
 | --- | --- | --- |
-| `TruncateToolResults(max_tokens, keep="head" \| "head_tail")` | 常驻 | 超长的 tool 结果截到上限，结尾加 `[cut: N more characters not shown]` |
+| `TruncateToolResults(max_tokens, keep="head" \| "head_tail")` | 常驻 | 超长的 tool 结果截到上限，加 `[cut: N more characters not shown]`；加上标记反而更长时不截。上限按整个结果算：一个结果有几段文字时，超了就用换行把它们接成一段（位置和 `extra` 用第一段的）再截；`head_tail` 的尾部只从头部剩下的部分里取，两段不会重叠 |
 | `MaskToolResults(keep_last=N)` | 削减 | 从最旧的**批次**开始，把批次里每个 tool 结果的内容换成 `[result cleared to save context; call {name} again if you need it]`，最近 N 个批次不动；结果里的图片一并换掉 |
-| `MaskOpaque(keep_last=N)` | 削减 | 旧的 `image` / `document` 块（消息里的，和 tool 结果里的）换成 `[{kind} removed to save context]`（宿主 B 现在对附件的做法）；不碰 `thinking` |
-| `DropOldest(keep_last_turns=N)` | 削减 | 删掉最旧的整轮（§3.1 的定义，所以批次不会被拆开），开头留一条 `[N earlier messages not shown]`。默认不在步骤里，调用方明确要才加 |
+| `MaskOpaque(keep_last=N)` | 削减 | 旧的 `image` / `document` 块（消息里的，和 tool 结果里的）换成 `[{kind} removed to save context]`（宿主 B 现在对附件的做法）；不碰 `thinking`。单位是"一条带图片或文档的消息"，一条消息里的都一起削；`keep_last` 数的是最近几条这样的消息 |
+| `DropOldest(keep_last_turns=N)` | 削减 | 删掉最旧的整轮（§3.1 的定义，所以批次不会被拆开），在第一条被删消息的位置留一条 `[N earlier messages not shown]`（N 是删掉的消息数）。含受保护消息的轮不删。默认不在步骤里，调用方明确要才加 |
 
-宿主可以写自己的步骤（`Step` Protocol：`name`、`always`、`apply(view, need) -> (view, actions)`），同样受 §5.2 约束，
-包括运行时的 `UnreportedChange` 检查；共用的不变量测试以 fixture 的形式提供给宿主。
+所有步骤都不碰受保护的消息（pinned 的、最后一轮人话那一条）。
+
+**宿主自己的步骤**（C1a 实现的协议）：步骤在 `Entry(ref, message)` 上工作，`ref` 是调用方的 key，没有 key 时是
+输入里的位置 `#i`，新插入的消息用自己的 ref（如 `+drop_oldest`）。
+
+- 常驻步骤（`AlwaysStep`）：`name`、`always = True`、`apply(entries, ctx) -> (entries, actions)`。
+- 削减步骤（`CuttingStep`）：`name`、`always = False`、`units(entries, ctx) -> [Unit]`（从旧到新、可以削的单位，
+  `Unit.refs` 是它覆盖的消息；`Unit.at` 是步骤自己的定位）、`apply(entries, units, ctx)`（只削给它的这几个单位）。
+  `fit()` 决定削几个：先重放 `state` 里切点及之前的单位，超过高水位时再往后加到低水位。加的时候只停在消息的边界上
+  （同一条消息的几个单位一起削，因为切点记的是整条消息）；不假设"削得越多越省"（占位可能比原文长）：一次把所有
+  单位都削掉、从被动过的消息算出每个单位省多少，用累加和估出每个个数的总数，取最少能到低水位的个数，到不了就取
+  最省的那个；再真正削一次、精确地数，估少了就往后试。都不如重放省的话保持重放。
+- `StepContext` 给出计数器和受保护的 ref。
+- 每个步骤执行后 `fit()` 检查：受保护的消息和 thinking 块没变（`ProtectedChange`）；没报告的消息原样、原序都在，
+  新增的消息都报告了（`UnreportedChange`）；配对仍然完整（`BrokenPairing`）。
+- 每个候选输出都要检查，包括 `fit()` 二分查找时试过、最后没用上的，所以违反规则的步骤一定会被发现。
+- `lite_context.testing.check_step(step)` 把宿主的步骤放进 `fit()`，在几段样例对话（并行批次、没完成的批次、
+  pinned、图片、thinking）和几个预算上跑，检查上面这些规则、两次调用结果相同、输入没变；再把每段对话一轮一轮
+  条地加长（三个预算）、每次传回 `state`，检查切点没动的那几次，上一次的请求是这一次的前缀（cache 不被破坏；刚离开
+  保护的那条消息除外，§5.4）；再跑一次没有 key 的历史。返回步骤实际改动过的次数。样例里有单独的图片、一条消息里
+  两张图片、并行批次里每个结果各带一张图片。
 
 ### 5.4 状态：为什么削减要记下来
 
 `fit()` 是纯函数，只看输入。如果不记下上次削到了哪里，原始历史一旦超过高水位，之后每一轮都会重新削到低水位，
 而历史每轮都在变长，于是每轮都多 mask 一条旧消息，prompt cache 每轮都从那里失效。所以每个削减步骤的结果是一个
-**切点**（"mask 到第几个批次"、"drop 到第几轮"），存在 `ContextState` 里：
+**切点**：它削到了输入里的哪一条消息（`through`），加上输入从开头到这条消息的 ref 的摘要值。重放时，这个步骤
+在 `through` 及之前的所有单位都削掉。切点按位置而不按"前几个单位"记：前面的步骤删掉了某些单位，或者某条消息
+离开了保护（最后一轮人话换了一条），单位列表会变，但位置不变，所以不会误报 `StaleState`（C1a review 发现）。
+代价：离开保护的那张旧图片会在下一次重放时被削掉，旧消息因此改动一次。单位的先后由 `fit()` 按输入位置排，
+不依赖步骤列出的顺序。切点存在 `ContextState` 里：
 
 ```python
 @dataclass(frozen=True)
 class ContextState:
-    compaction: Compaction | None
-    cuts: Mapping[str, Cut]       # step name -> how far it has cut, with the covered keys' digest (§6.2)
+    cuts: Mapping[str, Cut]       # step name -> Cut(through: ref, digest of the input refs up to it)
+    compaction: Compaction | None # C1b
 ```
 
 - 下一次调用传回 `state`：已有的切点原样重放；只有在重放后仍超过高水位时，切点才往前推。切点只往前，不后退。
+- 往前推的切点如果让总数反而变大（`DropOldest` 的占位比删掉的几条短消息还长），就不采用，保持重放的结果。
 - 调用方把 `state` 存在历史旁边（`to_json()` / `from_json()`，一列 JSON 即可；格式带版本号，不认识的版本报错）。
   不传 `state` 等于从零开始，结果仍然正确，只是 cache 不稳定。
 - 切点和 `Compaction` 一样带被覆盖消息 key 的摘要值；历史在切点之前被改过时抛 `StaleState`（§6.2）。
+- **切点量的是应用摘要之后的历史**。一次新的压缩（§6.1 `accept`）返回的 `state` 不带切点：被摘要覆盖的单位已经
+  不在了，旧切点的摘要值对不上；而且压缩本身已经让 prompt cache 从开头失效，从零开始削不损失什么（C1a 收尾时定，
+  见阶段记录）。
+- key 不能以 `#` 或 `+` 开头（那是 lite-context 内部的 ref），否则 `ValueError`。
+- 切点要靠 key：消息没有 key 时 `fit()` 照样能削，但返回的 `state` 不记切点；带着切点的 `state` 配上没有 key 的
+  消息抛 `StaleState`。这一次调用的步骤里没有的切点不带进新 `state`。
 
 ## 6. 摘要：`Compaction`
 
@@ -290,7 +322,8 @@ store(new_state)                                      # the caller persists it n
 
 ### 6.2 应用摘要
 
-`fit(..., state=s)`，`s.compaction = c`：
+`fit(..., state=s)`，`s.compaction = c`。应用摘要在 `fit()` 里是一个内部步骤：它像别的步骤一样报告动作（被覆盖的
+消息 `summarised`、摘要消息 `inserted`），经过同一个运行时检查，不另写一份规则：
 
 1. 找到 `c.covers_through` 的位置；找不到 → `StaleState`。
 2. 从 pinned 前缀之后到这个位置的消息数必须等于 `c.covered_count`，它们 key 的摘要值必须等于 `c.covered_digest`；
@@ -406,7 +439,7 @@ lite-context/
 | --- | --- | --- |
 | S0 | 仓库、设计文档、AGENTS.md / CLAUDE.md / README、项目 KB、workspace `AGENTS.md` 登记、端口 8750 登记 | 本文经 owner 确认；Codex 对设计的 review 已处理 |
 | C0 | 骨架：pyproject（uv、uv_build、ruff、mypy strict、pytest、`requires-python >=3.11`）、CI（3.11 + 3.12）、拒绝 socket 的 conftest；§3 的类型和 `anthropic` / `openai` adapter；§4 的计数器和预算；`Report`、`DoesNotFit` | 两个版本上 ruff、mypy、pytest 全绿；adapter 往返性质测试加 §3.2 列出的每个具名用例；表外输入抛 `UnsupportedInput`；`Opaque` 的估算按种类且不对 `raw` 计数；核心 import 时没有第三方模块（测试按 §2 的清单检查 `sys.modules`）；`fixed` 超预算直接 `DoesNotFit` |
-| C1 | `fit()` 与 §5.3 的四个步骤、高低水位、`ContextState` 与切点（§5.4）、§6 的 `plan_compaction` / `accept` / `acompact`、`SummaryPolicy` 与应用摘要 | §5.2 七条规则各有测试（含 `UnreportedChange` 抓住一个故意不报告的自写步骤）；同一输入两次 `fit()` 结果相同；带 `state` 连续调用 20 轮、历史每轮变长：被改动的旧消息只在越过高水位的那几轮变化，其余轮次与上一轮的输出前缀逐字节相同（cache 稳定性）；不完整配对的三种情况（最后批次未完成放行、缺结果和缺 call 抛 `BrokenPairing`）；`keep_last` 按批次计数；`DropOldest` 不拆开以 tool 结果开头的轮；超大的最新 tool 结果被常驻步骤截断而不是 `DoesNotFit`；thinking 块不被任何步骤改动；`StaleState` 的三种情况（找不到切点、数量或摘要值不符、切点不在轮边界）；摘要后原 messages 不变、输出以摘要开头；后一次压缩吃进前一次；截断或空摘要失败；切点不拆配对、不越过 pinned 消息、pinned 前缀留在摘要之前；找不到 `covers_through` 报错；`testing.py` 的 fixture 能套在一个宿主自写的步骤上 |
+| C1（分两步：C1a = `fit()`、步骤、`ContextState` 与切点、运行时检查、`testing.check_step`；C1b = §6 的摘要） | `fit()` 与 §5.3 的四个步骤、高低水位、`ContextState` 与切点（§5.4）、§6 的 `plan_compaction` / `accept` / `acompact`、`SummaryPolicy` 与应用摘要 | §5.2 七条规则各有测试（含 `UnreportedChange` 抓住一个故意不报告的自写步骤）；同一输入两次 `fit()` 结果相同；带 `state` 连续调用 20 轮、历史每轮变长：被改动的旧消息只在越过高水位的那几轮变化，其余轮次与上一轮的输出前缀逐字节相同（cache 稳定性）；不完整配对的三种情况（最后批次未完成放行、缺结果和缺 call 抛 `BrokenPairing`）；`keep_last` 按批次计数；`DropOldest` 不拆开以 tool 结果开头的轮；超大的最新 tool 结果被常驻步骤截断而不是 `DoesNotFit`；thinking 块不被任何步骤改动；`StaleState` 的三种情况（找不到切点、数量或摘要值不符、切点不在轮边界）；摘要后原 messages 不变、输出以摘要开头；后一次压缩吃进前一次；截断或空摘要失败；切点不拆配对、不越过 pinned 消息、pinned 前缀留在摘要之前；找不到 `covers_through` 报错；`testing.py` 的 fixture 能套在一个宿主自写的步骤上 |
 | C2 | §7：`split`、`pack`、`halving`、`reduce_tree`、`select` | 用两个首批宿主现有实现的行为写测试（重叠比例、切在换行、单元超预算报错、对半到 `min_size` 后抛出、分层次数、去重）；`reduce_tree` 在 `merge` 不缩短输入、单条超预算、到 `max_depth` 时都抛出而不是死循环；调用方传入的 fake 记录每次调用的输入，断言分组和顺序 |
 | C3 | 发布 v0.1.0 release wheel | 一个新的 3.11 pip 环境和一个 3.12 uv 项目都能从 wheel 安装并跑通 README 的例子 |
 | C4 | 宿主 A、B 同时接入（各自仓库里做，各自收尾）；lite-context 这边只修接入中发现的问题 | 两个宿主的全部测试通过；接入前后同一批调用的输入 token、超窗口失败、cache 命中写进 KB；宿主 B 的 `ContextState` 持久化有迁移和测试；**通过条件**：用接入前录下的一批真实请求重放，超窗口失败为 0，输入 token 不高于接入前，两个宿主各自的测试全绿 |
@@ -473,6 +506,82 @@ lite-context/
   6. `CharEstimate`、`Budget` 接受不可能的数 → 构造时和 `available()` 里校验（两条参数化测试）。
   只记录不改：`restore` 在手工构造的 `extra` 与核心字段同名时让核心字段赢（adapter 自己产生的 `extra` 不会同名）；
   `Message` 因为 `extra` 是 dict 而不能 hash（C1 若需要再说）；PDF 页数估计的局限（§4）。
+
+- **C1a（2026-11-26）**：`structure.py`（批次、轮、配对检查）、`steps.py`（`Entry` / `Unit` / `StepContext`、
+  `AlwaysStep` / `CuttingStep` 协议、四个步骤、固定占位文本）、`state.py`（`ContextState`、`Cut`、JSON 带版本）、
+  `fit.py`（流程、高低水位、重放与推进切点、每步之后的运行时检查）、`testing.py`（`check_step`）；新错误
+  `BrokenPairing`、`StaleState`、`UnreportedChange`、`ProtectedChange`；`Report` 加上动作和前后数字。与本文的
+  偏差：批次规则收紧（还有 call 没回答时，下一条必须是带结果的消息）；`DropOldest` 的占位放在第一条被删消息的位置；
+  所有步骤都不碰受保护消息。
+  规则 → 测试（`tests/test_fit.py`，除另注）：
+  - §5.2-1 纯函数、输入不变：`test_the_input_is_untouched_and_the_same_input_gives_the_same_output`。
+  - §5.2-2 批次不拆开：`test_mask_keeps_the_last_n_batches_counting_a_parallel_batch_once`、
+    `test_an_unfinished_batch_is_never_masked`；配对检查 `test_structure.py::test_broken_pairing_is_refused`（五种）；
+    步骤拆开配对被抓 `test_a_step_that_breaks_a_rule_is_caught_at_run_time[break-pair]`。
+  - §5.2-3 pinned：`test_a_pinned_batch_is_skipped_and_the_next_one_masked`、
+    `test_drop_oldest_never_drops_a_turn_holding_a_pinned_message`、`...caught_at_run_time[touch-pinned]`。
+  - §5.2-4 最后一轮人话受保护、最新 tool 结果可截：`test_mask_opaque_removes_old_images_but_not_the_last_human_turns_or_thinking`、
+    `test_the_newest_tool_result_is_truncated_rather_than_failing_every_call`。
+  - §5.2-5 报告与运行时检查：`test_cutting_steps_stop_at_the_low_water_mark`（动作逐条比对）、
+    `...caught_at_run_time[silent-edit]`、`test_testing.py::test_a_host_step_that_hides_a_change_fails`。
+  - §5.2-6 固定占位：截断、mask、opaque、drop 四条测试都逐字比对常量。
+  - §5.2-7 thinking：`test_a_step_that_removes_a_thinking_block_is_caught` 和 opaque 那条。
+  - §5.1 高低水位：`test_nothing_is_cut_below_the_high_water_mark`、`test_cutting_steps_stop_at_the_low_water_mark`、
+    `test_when_every_step_has_run_and_it_still_does_not_fit_it_raises_with_the_report`、
+    `test_compaction_is_due_when_the_cut_history_is_still_over_the_high_water_mark`。
+  - §5.4 状态：`test_with_state_old_messages_change_only_on_the_turns_that_cross_the_high_water_mark`（20 轮，cache
+    稳定性）、`test_state_is_replayed_even_when_the_history_would_fit_without_it`、
+    `test_state_from_a_history_that_changed_before_the_cut_is_stale`、`test_without_keys_no_cuts_are_kept`、
+    `test_state_survives_json_and_an_unknown_version_is_refused`。
+  - `check_step`：`test_testing.py`（四个内置步骤通过且确实改动过，隐瞒改动的宿主步骤失败）。
+  见红：测试先写，在没有实现时全部失败；之后对 14 处关键代码逐一破坏（高水位门槛、低水位、重放、保护检查、未报告
+  检查、thinking 检查、配对检查、摘要值、未完成批次、opaque 保护、drop 保护、keep_last、未回答的 call、二分查找），
+  每处都有测试变红，再恢复。
+  `/simplify`（两个子代理）：采纳——`fit()` 的削减循环原来对每加一个单位都重放并重数整段历史（1000 条消息首次
+  调用 356–526 ms），改成每条消息只数一次、之后只重数步骤报告过的消息，并用二分查找定单位数（同样的输入 6–21 ms，
+  动作数不变）；`MaskToolResults` 直接从批次的 call 消息里取工具名，不再每次重建批次；三个步骤共用 `_rewrite`；
+  重复 key 检查共用 `check_unique`；测试的 `COUNTER` 用 `lite_context.testing` 里的；去掉死分支和一个 type ignore；
+  thinking 检查只看被动过的消息。设计上定下：新压缩不带切点、切点量摘要之后的历史（§5.4）；应用摘要是走同一个
+  运行时检查的内部步骤（§6.2），C1b 照此实现。跳过——把 `Unit` 做成泛型载荷（工具名改从消息里取之后没有需要）。
+  代码 review（Codex 不可用，子代理代替）：9 条发现，8 条修复、1 条记录；回归测试先红后绿：
+  1. 一个削减步骤推进后，后面步骤的单位列表变短，"前 n 个单位 + 摘要值"对不上，正常增长也抛 `StaleState` →
+     切点改成"削到哪一条消息 + 输入到那里的 ref 摘要值"，按位置重放（§5.4）
+     （`test_two_cutting_steps_keep_working_as_the_history_grows`，要求出现"一个步骤越过另一个步骤的切点"）。
+  2. 保护离开一张旧图片后它插进单位列表中间，同样误报 → 同一个修复
+     （`test_protection_moving_off_an_old_image_does_not_make_the_state_stale`）。
+  3. 调用方的 key `#1` 和没有 key 的消息的位置 ref 撞上，计数算错，超预算却不报错 → 保留 `#`、`+` 前缀；检查时
+     也要求 ref 唯一（`test_keys_that_look_like_internal_refs_are_refused`、`...caught_at_run_time[duplicate]`）。
+  4. `DropOldest` 的占位比删掉的消息还长，本来装得下却 `DoesNotFit` → 不采用让总数变大的切点
+     （`test_a_cut_that_would_cost_more_than_it_saves_is_not_taken`）。
+  5. `check_step` 不考 state 和增长 → 加增长与无 key 的运行；`fit()` 自己按位置排单位，所以"新到旧列出单位"
+     不再是错误（`test_the_order_a_step_lists_its_units_in_does_not_matter`）；增长检查抓得住输出随历史漂移的步骤
+     （`test_a_step_whose_output_drifts_as_the_history_grows_fails`）。
+  6. 截断按段而不按整个结果 → 按整个结果（`test_truncation_limits_a_whole_result_not_each_text_part`）。
+  7. `head_tail` 在不可加的计数器下头尾重叠 → 尾部只从剩下的部分取
+     （`test_head_and_tail_never_overlap_even_with_a_counter_that_is_not_additive`）。
+  8. 只记录：`DropOldest` 的占位是一条带文字的 user 消息，会被当成一轮的开头；`fit()` 里只有 `DropOldest` 自己按轮
+     切、而且看的是它的输入，所以现在没有影响。
+  9. `from_json` 对畸形输入抛各种异常 → 统一 `ValueError`（`test_a_malformed_state_is_a_value_error`）。
+  另外：二分查找时试过的每个候选都要过运行时检查（否则一个被放弃的违规输出不会被发现）。
+  测试 1 的最终版本（预算 1200、15 轮）没有在旧代码上跑过；它的第一版（预算 600）和测试 2 在旧代码上是红的。
+  修复后的计时与修复前相同量级（1000 条消息、三个削减步骤首次 27 ms）。
+  第二轮 review（切点改动较大，按收尾规则再审一次；子代理写了随机增长探针：随机历史一条一条加长、随机步骤组合和
+  预算、每次传回 state）：6 条发现全部修复，回归测试先红后绿：
+  1. 切点记整条消息，但 `MaskOpaque` 一张图片一个单位，可能只削了一条消息里的一部分，下次重放把其余的也削了 →
+     `fit()` 只在消息边界上停（`test_a_host_steps_units_in_one_message_are_cut_together`，宿主自己的按图片步骤）。
+  2. `MaskOpaque` 的 `keep_last` 边界落在一条消息中间，同样的问题 → 单位改成一条消息
+     （`test_images_in_one_message_are_cut_together_so_replay_cuts_no_more`）。
+  3. 二分查找假设"削得越多越省"，mask 比占位还短的结果会变长，找不到其实存在的切法 → 改成上面的估算加验证
+     （`test_a_cut_is_found_even_when_masking_some_results_makes_them_longer`、
+     `test_when_no_cut_reaches_the_low_mark_the_cheapest_one_that_fits_is_taken`）。线性扫描时首次调用退回到
+     392–667 ms，改成估算加验证后 10–15 ms（1000 条消息）。
+  4. 同一个 `Text` 对象出现两次时截断结果重复 → 按位置找（`test_truncation_handles_the_same_text_object_twice`）。
+  5. 截断加标记后反而更长 → 不截（`test_truncation_never_makes_a_result_longer`）；原来两条截断测试的输入因此改长。
+  6. `check_step` 的样例里没有一条消息多张图片 → 加上，并且一条一条地加长、三个预算。
+  7. 只记录：离开保护的图片在下一次重放时被削（§5.4 接受）；`check_step` 和随机增长测试对这一条放行。
+  随机增长探针收进仓库：`tests/test_growth.py`（150 个种子，每次检查无异常、同输入同输出、切点没动时前缀不变）；
+  另外手动多跑了 1000 个种子，没有失败。
+  见红补充：消息边界、最省回退、单位排序、唯一 ref、不采用更贵的切点这几处都用破坏代码的方式确认有测试变红。
 
 ## 15. 待确认
 

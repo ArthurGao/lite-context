@@ -92,9 +92,13 @@ def with_keys(messages: Sequence[Message], keys: Iterable[str]) -> list[Message]
     keys = list(keys)
     if len(keys) != len(messages):
         raise ValueError(f"{len(messages)} messages but {len(keys)} keys")
+    check_unique(keys)
+    return [replace(m, key=k) for m, k in zip(messages, keys, strict=True)]
+
+
+def check_unique(keys: Iterable[str]) -> None:
     seen: set[str] = set()
     for key in keys:
         if key in seen:
             raise ValueError(f"duplicate key {key!r}")
         seen.add(key)
-    return [replace(m, key=k) for m, k in zip(messages, keys, strict=True)]

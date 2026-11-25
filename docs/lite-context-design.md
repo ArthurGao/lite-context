@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C2 完成（2026-11-26）：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -678,6 +678,9 @@ lite-context/
   断言具体结果）和 `release`（v* 标签时把 `package` 构建的那份发布到 GitHub Release）。本地验证：uv 建的 3.11 环境、
   pip 建的 3.11 venv、一个 uv 3.12 新项目 `uv add <wheel>`，三处 smoke 都通过。README 改成真实用法和安装方式。
   发现：步骤列表先赋给变量时 mypy 推成 `list[object]`，要标注 `list[Step]`（README 写明）。
+  发布（owner 同意）：`v0.1.0` 标签 → CI 四个 job 全绿（test 3.11、3.12，package，release）→ GitHub Release 带
+  `lite_context-0.1.0-py3-none-any.whl` 和 sdist。验收：从 release URL 用 pip（3.11 venv）和 `uv add`（3.12 新项目）
+  安装，smoke 都通过。
 
 ## 15. 待确认
 

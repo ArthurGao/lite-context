@@ -29,8 +29,9 @@ the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (d
 2026-11-26**: `fit()`, the four steps, `ContextState` with cuts by position, the run-time checks after every step,
 `testing.check_step` (design §5). **C1b done 2026-11-26**: summaries — `plan_compaction`, `accept`, `acompact`,
 `SummaryPolicy`, applied by `fit()` under the same checks (design §6). C1 is complete. **C2 done 2026-11-26**:
-long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). **C3 prepared**: version 0.1.0,
-CI `package` / `release` jobs, `scripts/smoke.py`; the release is the `v0.1.0` tag (owner's go-ahead).
+long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). **C3 done 2026-11-26: v0.1.0
+released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a uv 3.12 project). Next: C4 — hosts
+A and B adopt it, in their own repositories (design §12, §14).
 
 ## Rules
 

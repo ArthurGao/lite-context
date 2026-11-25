@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
-from .count import Counter, count_message
+from .count import Counter, count_message, longest_prefix
 from .report import Action
 from .structure import Batch, batches, human_turns
 from .types import Message, Opaque, Part, Text, ToolCall, ToolResult
@@ -161,26 +161,13 @@ class TruncateToolResults:
 
     def _cut(self, text: str, counter: Counter) -> str:
         if self.keep == "head":
-            head = _longest(text, self.max_tokens, counter, from_end=False)
+            head = longest_prefix(text, self.max_tokens, counter, from_end=False)
             return f"{head}\n{TRUNCATED.format(n=len(text) - len(head))}"
-        head = _longest(text, self.max_tokens // 2, counter, from_end=False)
+        head = longest_prefix(text, self.max_tokens // 2, counter, from_end=False)
         rest = text[len(head) :]  # the tail comes only from what the head left
-        tail = _longest(rest, self.max_tokens - self.max_tokens // 2, counter, from_end=True)
+        tail = longest_prefix(rest, self.max_tokens - self.max_tokens // 2, counter, from_end=True)
         gone = len(rest) - len(tail)
         return f"{head}\n{TRUNCATED.format(n=gone)}\n{tail}"
-
-
-def _longest(text: str, tokens: int, counter: Counter, *, from_end: bool) -> str:
-    """The longest prefix (or suffix) of `text` that costs at most `tokens`."""
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        piece = text[len(text) - mid :] if from_end else text[:mid]
-        if counter.text(piece) <= tokens:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[len(text) - lo :] if from_end else text[:lo]
 
 
 # --- cutting ---

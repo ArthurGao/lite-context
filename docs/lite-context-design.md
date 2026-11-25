@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C1 完成（2026-11-26）：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C2 完成（2026-11-26）：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -355,20 +355,20 @@ Anthropic 会把它们合并，OpenAI 接受；要求严格交替的后端（有
 
 ## 7. 长文档与检索结果：`lite_context.docs`
 
-两个首批宿主各写了一遍的东西。模型调用都由调用方传入。
+两个首批宿主各写了一遍的东西。模型调用都由调用方传入。规则来自 KB `global/map-reduce-llm-guide.md` §3 和宿主的
+实测：先数，装得下就原样一次调用（切分路径的 prompt 和调用与不切时完全一样）；reduce 按预算把相邻笔记分组、一层层
+合并，单条笔记合不了、合并结果超预算都让整个 reduce 失败，绝不退回到直接拼接；只有调用方判定为"太大被拒"的失败才
+对半拆，别的失败原样抛出。
 
 | 函数 | 做什么 |
 | --- | --- |
-| `split(text, max_tokens, overlap=0.06, prefer="\n")` | 按 token 预算切分，带重叠，尽量切在换行处；每块带起止位置和它前面最近的标题 |
-| `pack(units, budget)` | 把连续的单元（页、段、笔记）按预算分组，不打乱顺序；单个单元超出预算时报 `DoesNotFit`，除非 `split_oversize=True` |
-| `halving(items, call, too_large=pred, min_size=1)` | 对一批 items 调 `call`；`too_large(exc)` 为真时对半拆开再调，到 `min_size` 还不行就抛出 |
-| `reduce_tree(notes, budget, merge)` | 分层 reduce：按预算分组、每组 `merge` 成一条，重复直到只剩一组 |
-| `select(chunks, budget, key=..., score=...)` | 在已排好序的检索结果里按预算取前几条，按 key 去重；报告写明丢了哪些 |
+| `split(text, max_tokens=, counter=, overlap=0.06, prefer="\n", heading=None) -> [Piece]` | 装得下就是原样一段。否则在每个 `prefer` 之后断开成小段（超限的小段先截到限内），每个小段只数一次；一段取尽可能多的整个小段，再用一次真实计数核对（不可加的计数器超了就从尾部退）；下一段往回重叠约 `overlap`，也从小段边界开始。小段计数相加对子词分词器是往高估，是安全的方向（KB 指南 §3）；总计数量约为全文的 3 倍。`heading` 是一个正则：每段带上它开始所在章节的标题行（开在标题行上就是这个标题；宿主 B 实测：不带时，切开后 60 条里 60 条丢了所属章节） |
+| `pack(units, budget=, cost=, overhead=0) -> [[unit]]` | 把连续的单元按预算分组，不打乱顺序；单个单元自己就超预算时 `DoesNotFit` |
+| `await halving(items, call, too_large=, min_size=1) -> Halved(calls)` | 调 `call(items)`；`too_large(exc)` 为真时对半拆开、先后调用；别的失败、到 `min_size` 还被拒、取消（`BaseException`，不交给 `too_large`）都原样抛出。`calls` 按顺序记下每次成功调用读的范围和它的结果，`results` 是拼起来的结果。`min_size` 至少为 1。文本按行拆：传 `text.splitlines(keepends=True)` |
+| `await reduce_tree(notes, budget=, cost=, merge=, overhead=0, max_depth=8) -> Reduced(notes, levels)` | 一层层合并相邻笔记，直到能一起放进预算；返回的笔记由调用方用自己的最终 prompt 读（中间合并和最终 reduce 的 prompt 不同）。每层的组按顺序一个一个合并（限额账户上并发只会被拒）。没有进展、合并结果超预算、到 `max_depth` 都 `DoesNotFit` |
+| `select(chunks, budget=, cost=, key=) -> Selected(chosen, duplicates, over_budget)` | 在调用方已经排好序的检索结果里按顺序取、按 key 去重；第一条放不下就停，之后不重复的都进 `over_budget`、重复的进 `duplicates`（排名低的短块不会挤掉排名高的；三个列表恰好分完输入） |
 
-规则：顺序不变；每次 `halving` / `reduce_tree` 的调用次数和分组写进报告；失败不吞掉。
-
-`reduce_tree` 的终止条件：每一轮的条数必须比上一轮少，否则抛 `DoesNotFit`（`merge` 的输出不比输入短，或单条笔记
-本身就超过预算）；每个 `merge` 的输出都要检查是否在预算内；`max_depth`（默认 8）到了还没收敛也抛出。
+单元、笔记、检索块都是泛型：调用方用自己的类型（页、`(范围, 文本)`、检索结果），给出 `cost`。
 
 ## 8. `Transcript`：给没有存储的宿主
 
@@ -438,7 +438,7 @@ lite-context/
   src/lite_context/
     types.py, count.py, fit.py, steps.py, compaction.py, report.py, errors.py
     adapters/      _common.py, anthropic.py, openai.py, lite_model.py (extra)
-    docs/          split.py, pack.py, halving.py, reduce.py, select.py
+    docs.py        split, pack, halving, reduce_tree, select
     transcript/    store.py, memory.py, pg/ (extra `pg`)
     server/        app.py (extra `server`)
     cli.py         litecontext serve | migrate
@@ -641,6 +641,37 @@ lite-context/
   改成 Protocol（lite-agent 在 C7 可以继承或 `replace` 它，届时再定）。
   见红：回归测试先红后绿；修复处逐一破坏（`keep_last_turns` 校验、轮数不足、JSON 规整、按 mark 清理、去前言），
   每处都有测试变红；"轮数不足"一处起初没有测试变红，补了 `test_fewer_turns_than_kept_gives_no_plan`。
+
+- **C2（2026-11-26）**：`docs.py`（`split`、`pack`、`halving`、`reduce_tree`、`select`，泛型）；`steps._longest`
+  移到 `count.longest_prefix`（`split` 也用），按文本自己的字符/token 比定窗口再二分，1 MB 文本切 8k 段约 20 ms。与本文
+  的偏差：一个模块而不是 `docs/` 包；`pack` 不切超大单元（单元的类型由调用方定，切不了），超了就 `DoesNotFit`；
+  `reduce_tree` 返回能一起放进预算的笔记，最终 reduce 由调用方做；`select` 遇到第一条放不下的就停。
+  规则 → 测试（`tests/test_docs.py`）：装得下原样一段 `test_text_that_fits_is_one_piece_exactly_as_given`；覆盖、
+  重叠、切在换行 `test_pieces_cover_the_text_overlap_and_end_at_a_line_break`；没有换行也切得开
+  `test_a_long_line_without_breaks_is_still_cut_to_size`；标题 `test_each_piece_carries_the_heading_above_where_it_starts`；
+  默认估算下不超限、1 MB 速度 `test_split_respects_the_limit_with_the_default_estimate_and_cuts_a_large_text_quickly`；
+  `pack` 两条；`halving` 三条（只拆太大的、别的失败一次调用后原样抛出、到最小仍抛出）；`reduce_tree` 五条（装得下不
+  合并、按层按序合并、单条合不了失败、到深度限制失败、合并结果超预算失败）；`select` 一条（排序、去重、遇超即停）。
+  见红：测试先写，没有实现时收集失败；之后破坏 13 处，起初 4 处没有测试变红：装得下的提前返回（与一般路径等价，
+  删掉）、切在换行（测试文本恰好整行落在 500，改了行长）、只拆太大的（不拆也会最终抛出同一个异常，测试改成断言只调
+  用一次）、深度限制（测试先撞上"没有进展"，加了一个每层都有进展的场景）；改完后都变红。
+
+  收尾：`/simplify`（子代理，四个角度）与代码 review（Codex 不可用，子代理代替）同时跑，两边去重后：
+  1. `halving` 的 `min_size=0` 无限递归 → 至少为 1（`test_halving_needs_a_minimum_of_at_least_one`）。
+  2. 捕获 `BaseException` 把取消交给了调用方的判断函数 → 只捕获 `Exception`
+     （`test_a_cancellation_never_reaches_the_size_predicate`）。
+  3. `select` 停下之后会丢块、`over_budget` 里有重复 → 停下后照样去重，三个列表分完输入
+     （`test_select_sorts_every_chunk_into_exactly_one_list`）。
+  4. `split` 每段都把剩下的全文数一遍，真实分词器下是全文的 66 倍 → 按小段只数一次，约 3 倍
+     （`test_split_counts_a_bounded_window_not_the_whole_rest_each_time`）；不可加的计数器有测试
+     （`test_a_counter_that_charges_more_for_the_whole_than_its_parts_is_still_respected`）；计数器自相矛盾时报错而不死循环。
+  5. 开在标题行上的段带的是上一个标题 → 带它自己所在章节的（`test_a_piece_that_starts_on_a_heading_carries_that_heading`，
+     原来那条标题测试的期望随之改）。
+  6. `Halved` 说不出哪些结果来自哪一段 → 每次调用一条记录（`test_halving_says_which_results_each_call_gave`）。
+  7. 四处相同的 `DoesNotFit` 构造合成 `_too_big`；`reduce_tree` 每层每条只数一次；去掉死代码。`DoesNotFit` 带的
+     `Report` 在这里只有 limit 和 overhead 有意义——没改成可选（会改公开接口），记在这里。
+  见红：回归测试先红后绿；修复处逐一破坏，都有测试变红；"超长小段先截断"一处破坏后测试卡死，加了防护让它报错，
+  之后破坏是一条测试失败而不是卡住。
 
 ## 15. 待确认
 

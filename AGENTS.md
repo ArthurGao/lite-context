@@ -28,8 +28,8 @@ If a change must contradict the design, update the design in the same change and
 the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (design §3, §4). **C1a done
 2026-11-26**: `fit()`, the four steps, `ContextState` with cuts by position, the run-time checks after every step,
 `testing.check_step` (design §5). **C1b done 2026-11-26**: summaries — `plan_compaction`, `accept`, `acompact`,
-`SummaryPolicy`, applied by `fit()` under the same checks (design §6). C1 is complete. Next: C2 — long documents
-(design §7).
+`SummaryPolicy`, applied by `fit()` under the same checks (design §6). C1 is complete. **C2 done 2026-11-26**:
+long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). Next: C3 — release v0.1.0.
 
 ## Rules
 

@@ -67,6 +67,29 @@ def _count_part(part: Part, counter: Counter) -> int:
     return part.tokens if part.tokens is not None else counter.opaque(part)
 
 
+def longest_prefix(text: str, tokens: int, counter: Counter, *, from_end: bool = False) -> str:
+    """The longest prefix (or suffix) of `text` that costs at most `tokens`, by binary search over
+    a window sized from the text's own characters per token, widened while it all fits."""
+    total = counter.text(text)
+    if total <= tokens:
+        return text
+    window = max(1, min(len(text), 2 * tokens * len(text) // max(total, 1) + 1))
+    while window < len(text) and counter.text(_piece(text, window, from_end)) <= tokens:
+        window = min(len(text), window * 2)
+    lo, hi = 0, window
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if counter.text(_piece(text, mid, from_end)) <= tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return _piece(text, lo, from_end)
+
+
+def _piece(text: str, n: int, from_end: bool) -> str:
+    return text[len(text) - n :] if from_end else text[:n]
+
+
 def count_message(message: Message, counter: Counter) -> int:
     return counter.per_message + sum(_count_part(p, counter) for p in message.parts)
 

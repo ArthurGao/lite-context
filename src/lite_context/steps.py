@@ -198,17 +198,21 @@ class MaskToolResults:
     def apply(
         self, entries: Sequence[Entry], units: Sequence[Unit], ctx: StepContext
     ) -> tuple[list[Entry], list[Action]]:
-        names = {  # each unit points at its batch's call message
-            c.id: c.name
-            for u in units
-            for c in entries[u.at[0]].message.parts
-            if isinstance(c, ToolCall)
-        }
+        # Per result message, the tool names of its own batch's calls: a call id that a later
+        # batch reuses (some backends number calls per reply) never reaches that later batch.
+        names: dict[str, dict[str, str]] = {}
+        for u in units:
+            batch = {
+                c.id: c.name for c in entries[u.at[0]].message.parts if isinstance(c, ToolCall)
+            }
+            for ref in u.refs[1:]:  # refs: the call message, then the result messages
+                names[ref] = batch
 
         def parts_of(i: int, e: Entry) -> tuple[Part, ...]:
+            own = names.get(e.ref, {})
             return tuple(
-                replace(p, content=(Text(MASKED_RESULT.format(name=names[p.call_id])),))
-                if isinstance(p, ToolResult) and p.call_id in names
+                replace(p, content=(Text(MASKED_RESULT.format(name=own[p.call_id])),))
+                if isinstance(p, ToolResult) and p.call_id in own
                 else p
                 for p in e.message.parts
             )

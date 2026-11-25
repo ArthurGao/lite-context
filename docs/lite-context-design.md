@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：v0.1.1（2026-11-26：wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：v0.1.2（2026-11-26：被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -685,6 +685,12 @@ lite-context/
 - **v0.1.1（2026-11-26，C4 准备时发现）**：wheel 里没有 `py.typed`，宿主的 pyright / mypy 会把 lite-context 当成
   无类型的包。加上 `src/lite_context/py.typed`；CI 的 `package` job 检查 wheel 里有它（加之前在本地构建确认这条检查
   失败）。
+
+- **v0.1.2（2026-11-26，宿主 A 接入的 review 发现）**：有些 OpenAI 兼容后端每次回复都把 call 编号成 `call_0`，
+  `MaskToolResults` 按 call id 在所有消息里找结果，于是旧批次被 mask 时，复用同一个 id 的最新结果也被 mask 了，模型
+  拿不到刚要的结果。改成每个批次只 mask 它自己那几条结果消息里的结果，工具名也取自它自己的 call 消息
+  （`test_a_call_id_reused_by_a_later_batch_does_not_mask_the_later_result`，改之前红）；随机增长测试也加了复用 id 的
+  历史（它检查前缀稳定，抓不到这个错误，单元测试负责）。
 
 ## 15. 待确认
 

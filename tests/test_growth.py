@@ -32,7 +32,8 @@ def history(r: random.Random) -> list[Message]:
             parts.append(Opaque(kind="image", raw={"t": t}))
         out.append(Message("user", tuple(parts), key=f"k{len(out)}", pinned=r.random() < 0.08))
         for b in range(r.randint(0, 3)):
-            ids = [f"c{t}_{b}_{j}" for j in range(r.randint(1, 3))]
+            reuse = r.random() < 0.2  # some backends number calls per reply: call_0 every time
+            ids = [f"call_{j}" if reuse else f"c{t}_{b}_{j}" for j in range(r.randint(1, 3))]
             calls = tuple(ToolCall(i, "s", "{}") for i in ids)
             thinking = Opaque(kind="thinking", raw={"x": 1}, text="th" * 5)
             out.append(Message("assistant", (thinking, *calls), key=f"k{len(out)}"))

@@ -628,3 +628,20 @@ def test_a_host_steps_units_in_one_message_are_cut_together() -> None:
         if fitted.state == state:
             assert fitted.messages[: len(previous)] == previous
         state, previous = fitted.state, fitted.messages
+
+
+def test_a_call_id_reused_by_a_later_batch_does_not_mask_the_later_result() -> None:
+    # Some OpenAI-compatible backends number calls per reply (call_0 every time).
+    msgs = [
+        human("h1", "q"),
+        calls("a1", "call_0"),
+        results("r1", ("call_0", "x" * 200)),
+        calls("a2", "call_0"),
+        results("r2", ("call_0", "y" * 200)),
+        calls("a3", "call_0"),
+        results("r3", ("call_0", "z" * 200)),
+    ]
+    fitted = fit(msgs, budget=Budget(500, 0), steps=[MaskToolResults(keep_last=1)], counter=COUNTER)
+    out = by_key(fitted.messages)
+    assert result_text(out["r3"]) == "z" * 200
+    assert [a.ref for a in fitted.report.actions] == ["r1", "r2"]

@@ -1,6 +1,6 @@
 [project]
 name = "lite-context"
-version = "0.0.0"
+version = "0.1.0"
 description = "Context management for LLM calls: what each call should see"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -36,7 +36,7 @@ exclude = ["*.md"]
 [tool.mypy]
 strict = true
 python_version = "3.11"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 mypy_path = "src"
 
 [tool.pytest.ini_options]

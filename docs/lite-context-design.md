@@ -673,6 +673,12 @@ lite-context/
   见红：回归测试先红后绿；修复处逐一破坏，都有测试变红；"超长小段先截断"一处破坏后测试卡死，加了防护让它报错，
   之后破坏是一条测试失败而不是卡住。
 
+- **C3（2026-11-26，准备）**：版本 0.1.0；CI 加 `package`（`uv build`，在干净的 3.11 环境里只装这个 wheel，用
+  `python -I` 跑 `scripts/smoke.py`：README 的完整例子，adapter → `fit` → JSON 状态 → `acompact` → 再 `fit` → `split`，
+  断言具体结果）和 `release`（v* 标签时把 `package` 构建的那份发布到 GitHub Release）。本地验证：uv 建的 3.11 环境、
+  pip 建的 3.11 venv、一个 uv 3.12 新项目 `uv add <wheel>`，三处 smoke 都通过。README 改成真实用法和安装方式。
+  发现：步骤列表先赋给变量时 mypy 推成 `list[object]`，要标注 `list[Step]`（README 写明）。
+
 ## 15. 待确认
 
 - **厂商的 count_tokens**：宿主 B 对 Claude 用 SDK 的 `messages.count_tokens`（一次网络调用）。核心的 `Counter`

@@ -29,7 +29,8 @@ the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (d
 2026-11-26**: `fit()`, the four steps, `ContextState` with cuts by position, the run-time checks after every step,
 `testing.check_step` (design §5). **C1b done 2026-11-26**: summaries — `plan_compaction`, `accept`, `acompact`,
 `SummaryPolicy`, applied by `fit()` under the same checks (design §6). C1 is complete. **C2 done 2026-11-26**:
-long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). Next: C3 — release v0.1.0.
+long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). **C3 prepared**: version 0.1.0,
+CI `package` / `release` jobs, `scripts/smoke.py`; the release is the `v0.1.0` tag (owner's go-ahead).
 
 ## Rules
 
@@ -76,6 +77,7 @@ uv run pytest                    # C0-C4 (about 7 s: tests/test_growth.py runs 1
 uv run --python 3.11 --isolated --with-editable . --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
 uv run --env-file .env pytest    # everything; PostgreSQL tests need LITECONTEXT_TEST_DATABASE_URL (from C5)
 uv run ruff check && uv run ruff format --check && uv run mypy
+uv build --out-dir dist && uv venv --python 3.11 /tmp/c && uv pip install --python /tmp/c dist/*.whl && (cd /tmp && /tmp/c/bin/python -I $OLDPWD/scripts/smoke.py)   # the wheel alone
 uv run litecontext serve          # the REST shell, loopback :8750 (extra `server`, from C6)
 uv run litecontext migrate        # the Transcript tables (extra `pg`, from C5)
 ```

@@ -42,6 +42,8 @@ jobs:
       - name: the tag names the version being released
         if: startsWith(github.ref, 'refs/tags/v')
         run: test -f "dist/lite_context-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+      - name: the wheel says it is typed (PEP 561), or hosts' type checkers treat it as untyped
+        run: python3 -c "import glob, zipfile; assert 'lite_context/py.typed' in zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist()"
       - name: the wheel works from a clean venv
         run: |
           uv venv --python 3.11 /tmp/clean

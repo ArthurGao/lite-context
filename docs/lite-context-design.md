@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：v0.1.1（2026-11-26：wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -682,6 +682,10 @@ lite-context/
   `lite_context-0.1.0-py3-none-any.whl` 和 sdist。验收：从 release URL 用 pip（3.11 venv）和 `uv add`（3.12 新项目）
   安装，smoke 都通过。
 
+- **v0.1.1（2026-11-26，C4 准备时发现）**：wheel 里没有 `py.typed`，宿主的 pyright / mypy 会把 lite-context 当成
+  无类型的包。加上 `src/lite_context/py.typed`；CI 的 `package` job 检查 wheel 里有它（加之前在本地构建确认这条检查
+  失败）。
+
 ## 15. 待确认
 
 - **厂商的 count_tokens**：宿主 B 对 Claude 用 SDK 的 `messages.count_tokens`（一次网络调用）。核心的 `Counter`
@@ -692,3 +696,6 @@ lite-context/
 - **token 级压缩**（LLMLingua 一类）：需要本地小模型，适合长文档不适合历史；有宿主要用时作为 §7 的可选步骤。
 - **Python 3.11 的下限**：宿主 B 升到 3.12 后，是否提到 3.12 与其它 lite 模块一致。
 - **项目 KB 的位置**：`KB/projects/lite-context/`（S0 创建）。
+- **`pack` 要不要允许单个超预算的单元自成一组**（C4 宿主 A）：宿主 A 的按页分组让一页超预算时自成一组、交给模型
+  （模型拒绝时再对半一次），`pack` 则直接 `DoesNotFit`。宿主 A 的病例流程这次不改（它的 §8.3 是有意的设计）；
+  等有宿主需要时再加一个选项。

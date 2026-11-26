@@ -34,7 +34,7 @@ released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a
 v0.1.2 (reused call ids). **C4 2026-11-26: host A adopted it** in its own repository; host B was trialled and reverted, deferred
 by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). **C5 done
 2026-11-26**: `Transcript` (async), `InMemoryStore`, `PgStore` (extra `pg`), the message codec, `litecontext
-migrate` / `pending` (design §8); **v0.2.0 released 2026-11-26** (verified installed by URL with the `pg` extra on 3.11, against the local database). **C6 done 2026-11-26**: the REST shell (`litecontext serve`, extra `server`, design §9); **v0.3.0 released 2026-11-26** (checked installed by URL with `pg` and `server` on 3.11). **C7 done 2026-11-26**: lite-agent v0.2.5's compactor renders and frames summaries through lite-context 0.3.1 (`render_transcript`, v0.3.1 released). C0–C7 are complete. **v0.3.2 released 2026-11-26**: PDF pages in compressed streams, `CharEstimate.calibrated` (design §4). What comes next is in design §14 "按需" and §15.
+migrate` / `pending` (design §8); **v0.2.0 released 2026-11-26** (verified installed by URL with the `pg` extra on 3.11, against the local database). **C6 done 2026-11-26**: the REST shell (`litecontext serve`, extra `server`, design §9); **v0.3.0 released 2026-11-26** (checked installed by URL with `pg` and `server` on 3.11). **C7 done 2026-11-26**: lite-agent v0.2.5's compactor renders and frames summaries through lite-context 0.3.1 (`render_transcript`, v0.3.1 released). C0–C7 are complete. **v0.3.2 released 2026-11-26**: PDF pages in compressed streams, `CharEstimate.calibrated` (design §4). What comes next is in design §14 "As needed" and §15.
 
 ## Rules
 
@@ -91,7 +91,7 @@ uv run --env-file .env litecontext migrate   # the Transcript tables (extra `pg`
    once (write it first, or break the line under test and watch it fail).
 2. Definition of done: ruff, ruff format, mypy, tests pass on 3.11 and 3.12; acceptance items covered by tests;
    design updated if behaviour changed.
-3. Conventional Commits (`feat(fit): …`). All code-facing text in English. No commit without the
+3. Conventional Commits (`feat(fit): …`). All code-facing text and docs (design doc, README, plans, comments) in English; Chinese only as examples or test data. No commit without the
    owner's go-ahead for that commit; `git add <paths>` only.
 4. **Stage close-out — every stage, after its code passes the checks, before its commit and before the
    next stage starts:**
@@ -106,7 +106,7 @@ uv run --env-file .env litecontext migrate   # the Transcript tables (extra `pg`
       matters: with a piped stdin `codex exec` waits for stdin to close and hangs in a background shell.
       If Codex is unavailable, say so; never skip silently.
    3. **Fix what holds up**: verify each finding before acting; a bug gets a failing regression test
-      first. A rejected finding is written down with a one-line reason (design §14 "阶段记录"), never
+      first. A rejected finding is written down with a one-line reason (design §14 "Stage records"), never
       silently dropped.
    4. **Re-run every check** (step 2) so they cover the final code. If step 3 changed code
       substantially, run steps 1 and 2 once more.

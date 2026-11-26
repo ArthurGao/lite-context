@@ -1,91 +1,118 @@
-# lite-context 设计文档
+# lite-context design document
 
-**状态：v0.3.2 已发布（2026-11-26）：压缩流里的 PDF 页数、`CharEstimate.calibrated`（§4、§15）；C0–C7 完成（2026-11-26）：lite-agent v0.2.5 的压缩器用上了 lite-context（C7）；v0.3.1 已发布：公开 `render_transcript`；C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
-LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
-与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
+**Status: v0.3.2 released (2026-11-26): PDF page counts in compressed streams, `CharEstimate.calibrated` (§4, §15);
+C0–C7 done (2026-11-26): lite-agent v0.2.5's compactor uses lite-context (C7); v0.3.1 released: public
+`render_transcript`; C6 done, v0.3.0 released (2026-11-26, GitHub Release wheel): REST shell `litecontext serve`
+(extra `server`); C5 done, v0.2.0 released (2026-11-26, GitHub Release wheel): `Transcript`, `InMemoryStore`,
+`PgStore`, `litecontext migrate`; C4: host A adopted, host B trialled then reverted and deferred (2026-11-26);
+v0.1.2 (a call id reused by a later batch no longer gets the new result masked); v0.1.1 (the wheel ships
+`py.typed`); v0.1.0 released (C3, 2026-11-26, GitHub Release wheel). C2 done: long-document tools (`split` /
+`pack` / `halving` / `reduce_tree` / `select`); C1 done: C1b summaries (`plan_compaction` / `accept` /
+`acompact`, `SummaryPolicy`, `fit()` applying summaries); C1a `fit()`, the four steps, `ContextState` and cut
+points, runtime checks; C0 done: neutral types, Anthropic / OpenAI adapters, counting and budget. Repository
+github.com/ArthurGao/lite-context. The first hosts are two Python projects that bring their own LLM layer
+(host A and host B below, §12), adopted together in C4.**
+When this document conflicts with the code, update it in the same change and say why in the commit.
 
-## 0. 决策记录
+## 0. Decision log
 
-决策的理由只写在这里，其它章节引用（§0）。"owner" 是主人定的；"提议" 是起草时的判断，主人没否决前按它做，
-否决时在这里改。
+The reasons for a decision are written only here; other sections cite this one (§0). "owner" means the owner
+decided; "proposed" means it was the drafting judgment, followed until the owner overrules it, and then changed
+here.
 
-| 日期 | 决策 | 谁 | 原因 |
+| Date | Decision | Who | Reason |
 | --- | --- | --- | --- |
-| 2026-11-26 | 单独做一个库 lite-context，只管"这一次调用，模型该看到什么"；直接调用 LLM 的项目和 lite-agent 都用它 | owner | 多数项目不用 lite-agent，直接调 LLM；它们的 chat 历史、tool 结果、长文档各自手写了一套（或没有），context rot 和超窗口直接报错是共同的缺口 |
-| 2026-11-26 | 形态：library 为主；REST API 是它上面的薄壳，不放逻辑 | owner | 与 lite-rag / lite-mem / lite-agent 一致；REST 给非 Python 的宿主 |
-| 2026-11-26 | 显式调用，不做 lite-model hook 或"所有请求自动经过"的中间层 | 提议 | 在调用层悄悄改写请求，"模型看到的"就和宿主记下的对不上，回放、审计、fork 都会错（KB `llm-app-architecture` §9）。lite-cache 能做成 hook 是因为它不改请求内容 |
-| 2026-11-26 | 核心不依赖任何 message 格式，也不依赖 lite-model：内部一套中立类型，边界上用 adapter | 提议 | 两个首批宿主都有自己的 LLM 层（一个用自有类型，一个用 Anthropic 格式的 dict），都不用 lite-model；强依赖 lite-model 等于要它们先换 LLM 层 |
-| 2026-11-26 | 原始历史永不改写；压缩是一条记下覆盖范围的 `Compaction`，它和削减的切点一起放在 `ContextState` 里，由调用方保存（§5.4） | 提议 | KB §9.1 "compaction masks and keeps provenance"。调用方本来就存历史（数据库、workflow 状态），再存一条摘要记录即可，不必为此引入 lite-context 的存储 |
-| 2026-11-26 | 装不下就报错（`DoesNotFit`），不悄悄丢内容 | 提议 | 两个首批宿主都明确选了"超限即失败"（一个 `case_too_large`，一个 `LLMInputTooLarge`），截断都当错误。lite-context 只做调用方声明过的裁剪 |
-| 2026-11-26 | 需要模型的步骤（写摘要、map-reduce 的 merge）由调用方传入函数，lite-context 自己不调模型 | 提议 | 模型调用留在宿主自己的 role 层（workspace 规则：每次调用都经过 role、带 provenance）；核心因此是纯函数，可以直接在 Temporal workflow 里用 |
-| 2026-11-26 | REST 模式下摘要默认由客户端写：服务返回写摘要用的 prompt，客户端调自己的模型后把摘要交回。服务端自己调 role 是以后的可选项 | 提议 | 服务不持有模型凭证、不花钱；模型选择和计费留在各个项目 |
-| 2026-11-26 | Python ≥ 3.11，CI 跑 3.11 和 3.12 | owner | 宿主 B 跑 3.11；纯 Python 库支持 3.11 的成本很低 |
-| 2026-11-26 | 核心零运行时依赖；lite-model adapter、tiktoken 计数器、PostgreSQL、FastAPI 各是一个 extra | 提议 | 宿主 B 用 pip requirements，依赖越少越容易接；核心是纯数据处理 |
-| 2026-11-26 | 宿主 A、B 在 C4 同时接入 | owner | 一次验证两种接入形态：tool loop 的 masking，和 chat 历史的预算 + 摘要 |
-| 2026-11-26 | 宿主 B 的 chat 无状态裁剪：每次请求重新 `fit()`，不存 `ContextState`、不做摘要、不加 migration；文档的切分 / 对半 / reduce 先不换 | owner | 先用最小改动拿到"装得下"；cache 稳定和摘要等有长对话的测量再说。宿主 B 的文档工具用厂商 async `count_tokens` 计精确数，核心的 cost 是同步的（§15） |
-| 2026-11-26 | 宿主 B 先不改：试接入做完、review 过后整体撤回，宿主 B 保持原样 | owner | 未说明原因；试接入的补丁和学到的东西留在下面 §14 的记录里，以后再接时用 |
-| 2026-11-26 | 收尾流程与其它 lite 模块相同：`/simplify` → Codex 只读 review → 修复或写下否决理由 → 重跑全部检查 | owner | workspace 约定 |
+| 2026-11-26 | Build a separate library, lite-context, that only handles "what should the model see on this one call"; projects that call the LLM directly and lite-agent both use it | owner | Most projects do not use lite-agent and call the LLM directly; each hand-wrote its own chat history, tool result and long-document handling (or has none), and context rot and outright window-overflow errors are a shared gap |
+| 2026-11-26 | Form: a library first; the REST API is a thin shell on top and holds no logic | owner | Consistent with lite-rag / lite-mem / lite-agent; REST is for non-Python hosts |
+| 2026-11-26 | Explicit calls; no lite-model hook and no "every request passes through" middleware | proposed | Rewriting the request quietly at the call layer makes "what the model saw" differ from what the host recorded, so replay, audit and fork all go wrong (KB `llm-app-architecture` §9). lite-cache can be a hook because it does not change the request content |
+| 2026-11-26 | The core depends on no message format and not on lite-model: one set of neutral types inside, adapters at the edges | proposed | Both first hosts have their own LLM layer (one uses its own types, one uses Anthropic-format dicts) and neither uses lite-model; a hard dependency on lite-model would force them to change their LLM layer first |
+| 2026-11-26 | The original history is never rewritten; compaction is a `Compaction` that records its coverage, kept in `ContextState` together with the truncation cut points and stored by the caller (§5.4) | proposed | KB §9.1 "compaction masks and keeps provenance". The caller already stores the history (database, workflow state), so it can store one more summary record; there is no need to bring in a lite-context store for this |
+| 2026-11-26 | If it does not fit, raise (`DoesNotFit`); never drop content silently | proposed | Both first hosts explicitly chose "over the limit means failure" (one `case_too_large`, one `LLMInputTooLarge`) and treat truncation as an error. lite-context only does the trimming the caller declared |
+| 2026-11-26 | Steps that need a model (writing a summary, the merge of a map-reduce) take a function from the caller; lite-context never calls a model itself | proposed | Model calls stay in the host's own role layer (workspace rule: every call goes through a role and carries provenance); the core is therefore pure functions and can be used directly inside a Temporal workflow |
+| 2026-11-26 | In REST mode the client writes the summary by default: the service returns the prompt for writing the summary, the client calls its own model and hands the summary back. The service calling a role itself is a later option | proposed | The service holds no model credentials and spends no money; model choice and billing stay in each project |
+| 2026-11-26 | Python ≥ 3.11, CI runs 3.11 and 3.12 | owner | Host B runs 3.11; supporting 3.11 costs a pure-Python library very little |
+| 2026-11-26 | The core has zero runtime dependencies; the lite-model adapter, the tiktoken counter, PostgreSQL and FastAPI are each an extra | proposed | Host B uses pip requirements, and fewer dependencies are easier to adopt; the core is pure data processing |
+| 2026-11-26 | Hosts A and B are adopted together in C4 | owner | Validates two adoption shapes at once: masking in a tool loop, and budget + summary for chat history |
+| 2026-11-26 | Host B's chat does stateless trimming: `fit()` again on every request, no stored `ContextState`, no summaries, no migration; document split / halving / reduce are not switched yet | owner | Get "it fits" with the smallest change first; cache stability and summaries wait for measurements on long conversations. Host B's document tools count exact numbers with the vendor's async `count_tokens`, and the core's cost is synchronous (§15) |
+| 2026-11-26 | Host B is left unchanged for now: the trial was finished and reviewed, then reverted as a whole, and host B stays as it was | owner | No reason given; the trial's patches and what was learned stay in the record in §14 below, for use when it is adopted again |
+| 2026-11-26 | The close-out is the same as the other lite modules: `/simplify` → read-only Codex review → fix or write down the rejection reason → re-run every check | owner | Workspace convention |
 
-## 1. 概述
+## 1. Overview
 
-lite-context 回答一个问题：**这一次调用，模型应该看到什么**。输入是调用方的完整历史（或一组文档、检索结果）
-和一个 token 预算；输出是这一次要发送的内容，外加一份报告，写明裁掉了什么、压缩了什么、前后各多少 token。
-发送仍由调用方自己做。
+lite-context answers one question: **what should the model see on this one call**. The input is the caller's
+full history (or a set of documents or retrieval results) and a token budget; the output is the content to send
+this time, plus a report saying what was trimmed, what was compacted, and how many tokens before and after.
+The caller still does the sending.
 
-三类场景：
+Three kinds of scenario:
 
-- **多轮历史**：chat、自写的 tool loop。历史越来越长，旧的 tool 结果占大头（§5、§6）。
-- **长文档、检索结果**：一次调用装不下的文档要切分、分组、map-reduce；检索结果要在预算内挑选（§7）。
-- **没有自己存储的宿主**：用 lite-context 的 `Transcript` 存历史（§8）。
+- **Multi-turn history**: chat, and hand-written tool loops. The history keeps growing, and old tool results take
+  up most of it (§5, §6).
+- **Long documents and retrieval results**: a document that does not fit in one call has to be split, grouped
+  and map-reduced; retrieval results have to be selected within a budget (§7).
+- **Hosts with no storage of their own**: use lite-context's `Transcript` to store the history (§8).
 
-### 来源
+### Sources
 
-- KB `global/llm-app-architecture.md` §9（event log + 纯投影，压缩只遮盖）、§11（自写 loop 的截断）。
-- lite-agent 的 S3b 压缩（它的设计 §6）：摘要事件、覆盖区间、"后一次压缩从头覆盖"、切点不拆开 tool call 和结果、
-  截断或为空的摘要算失败。lite-context 把这些规则从 event log 里拿出来，变成不依赖 log 的形式。
-- 两个首批宿主的现有代码（§12）：按 token 预算把页分组、超限对半重试、分层 reduce、tool 结果在产生时截断、
-  "超限即失败"。
-- 公开研究（reported，未在本项目测过）：Chroma "Context Rot"（2025）——输入越长质量越差，远没到窗口上限就开始；
-  JetBrains "The Complexity Trap"（2025）——在 SWE-agent 上，把旧 observation 换成占位符的效果与 LLM 摘要相当、
-  成本低得多。
+- KB `global/llm-app-architecture.md` §9 (event log + pure projection, compaction only masks) and §11 (truncation
+  in a hand-written loop).
+- lite-agent's S3b compaction (its design §6): summary events, covered ranges, "a later compaction covers from
+  the start", cut points that never split a tool call from its result, and a truncated or empty summary counts as
+  a failure. lite-context takes these rules out of the event log and turns them into a form that does not depend
+  on a log.
+- The existing code of the two first hosts (§12): grouping pages by token budget, halving and retrying when over
+  the limit, tree reduce, truncating a tool result when it is produced, and "over the limit means failure".
+- Public research (reported, not measured in this project): Chroma "Context Rot" (2025) — the longer the input,
+  the worse the quality, starting well before the window limit; JetBrains "The Complexity Trap" (2025) — on
+  SWE-agent, replacing old observations with a placeholder works as well as an LLM summary at much lower cost.
 
-### 目标
+### Goals
 
-1. 一个 `fit()` 覆盖"历史太长"的常见做法，按调用方给的顺序逐级裁剪，每一步都写进报告（§5）。
-2. 压缩可逆、可审计：原文不改，摘要是一条带覆盖范围的记录（§6）。
-3. 长文档的切分、分组、对半重试、分层 reduce 做成共用工具，模型调用由调用方传入（§7）。
-4. 不依赖任何 message 格式：Anthropic dict、OpenAI dict、lite-model 类型、宿主自有类型都能接（§3）。
-5. 不联网、不花钱就能测：核心是纯函数，需要模型的地方用调用方传入的函数，测试里传 fake。
+1. One `fit()` covering the usual ways of handling "the history is too long", trimming level by level in the
+   order the caller gives, with every step written into the report (§5).
+2. Compaction is reversible and auditable: the original text is not changed, and a summary is a record with a
+   covered range (§6).
+3. Long-document split, grouping, halving retry and tree reduce are shared tools, with the model call passed in by
+   the caller (§7).
+4. Depend on no message format: Anthropic dicts, OpenAI dicts, lite-model types and a host's own types can all be
+   connected (§3).
+5. Testable with no network and no spend: the core is pure functions, and where a model is needed the caller
+   passes in a function, with a fake in tests.
 
-### 非目标（v1）
+### Non-goals (v1)
 
-- 不调模型（例外：以后可选的服务端摘要，§9）。
-- 不做 token 级压缩（LLMLingua 一类）；需要时作为 §7 的一个可选步骤再加（§15）。
-- 不维护模型窗口表：预算由调用方算好传入（宿主有自己的表或配置）。
-- 不做检索、embedding、rerank：那是 lite-rag。§7 的 `select` 只在已经排好序的结果里按预算挑。
-- 不做长期记忆：那是 lite-mem。
-- 不做 streaming。
+- No model calls (exception: an optional server-side summary later, §9).
+- No token-level compression (LLMLingua and the like); if needed it is added later as an optional step of §7
+  (§15).
+- No table of model windows: the caller computes the budget and passes it in (hosts have their own table or
+  configuration).
+- No retrieval, embedding or rerank: that is lite-rag. §7's `select` only picks within already-ranked results by
+  budget.
+- No long-term memory: that is lite-mem.
+- No streaming.
 
-## 2. 分层
+## 2. Layers
 
 ```
-宿主（Python，自有 LLM 层）──► adapter ──► lite-context 核心（纯函数）──► adapter ──► 宿主的 LLM 层 ──► 模型
-宿主（Python，lite-model）─────► adapter(lite-model) ─┘
-lite-agent（C7）──► 把事件映射成中立 Message ──► 同一个核心
-非 Python 宿主 ──HTTP──► REST 壳（§9）──► 同一个核心
-没有存储的宿主 ──► Transcript（§8）──► 同一个核心
+host (Python, own LLM layer) ──► adapter ─────────────┐
+host (Python, lite-model) ─────► adapter(lite-model) ─┴──► lite-context core (pure functions) ──► adapter ──► host's LLM layer ──► model
+lite-agent (C7) ──► maps events to neutral Messages ──► the same core
+non-Python host ──HTTP──► REST shell (§9) ──► the same core
+host with no storage ──► Transcript (§8) ──► the same core
 ```
 
-依赖方向：核心只用标准库。核心 = `types`、`count`（`CharEstimate`）、`fit`、`steps`、`compaction`、`report`、
-`errors`、`docs/`、`adapters/anthropic`、`adapters/openai`、`transcript/`（不含 `pg/`）、`testing`。
-extra：`adapters/lite_model`（`lite-model`）、`TiktokenCounter`（`tiktoken`）、`transcript/pg/`（`pg`）、`server/`（`server`）；
-核心不 import 它们。C0 的 `sys.modules` 检查就按这份清单。lite-context 不依赖任何 lite 模块。
+Dependency direction: the core uses only the standard library. Core = `types`, `count` (`CharEstimate`), `fit`,
+`steps`, `compaction`, `report`, `errors`, `docs/`, `adapters/anthropic`, `adapters/openai`, `transcript/`
+(without `pg/`), `testing`.
+Extras: `adapters/lite_model` (`lite-model`), `TiktokenCounter` (`tiktoken`), `transcript/pg/` (`pg`), `server/`
+(`server`); the core does not import them. C0's `sys.modules` check follows this list. lite-context depends on no
+lite module.
 
-## 3. 中立类型与 adapter
+## 3. Neutral types and adapters
 
-### 3.1 类型
+### 3.1 Types
 
-全部是 frozen dataclass（3.11 可用的写法：`TypeAlias`、`TypeVar`，不用 PEP 695）。
+All are frozen dataclasses (written in a way that works on 3.11: `TypeAlias`, `TypeVar`, no PEP 695).
 
 ```python
 Text(text: str, extra: Mapping[str, object] = {})
@@ -111,53 +138,70 @@ Message(
 )
 ```
 
-- `extra` 放核心不关心、但转回厂商格式时必须原样带上的字段：`cache_control`、OpenAI 的 `name`、`tool_calls: []`、
-  `function` 里多出来的字段。核心不读它，只搬运；被 mask 的部分不保留 `extra` 之外的原文。
-- `content_form` 记下 content 原来的形式（字符串、列表、`null`、没有这个键），是有类型的字段而不是 `extra` 里的
-  约定键，C1 的步骤替换内容时用 `dataclasses.replace` 保留它。为 `None`（手工构造）时，单个无 `extra` 的 `Text`
-  输出成字符串，其它输出成列表。
-- **共享而不复制**：adapter 不深拷贝。`Opaque.raw` 和 `extra` 里的嵌套对象（`cache_control` 等）在输入、中立消息和
-  输出之间是同一个对象；这是有意的（大块的图片、PDF 不复制）。约定：调用方和 lite-context 都不改动它们，要改就先
-  复制。lite-context 自己从不改动输入（每个 adapter 测试都检查输入没变）。
-- system prompt 和 tool 定义不是 `Message`：作为 `fixed` 文本（或直接给 token 数）传给 `fit()`，计入预算，永不裁剪。
-- `Opaque` 原样保留 adapter 不认识或不该动的内容（图片、PDF、thinking 块、厂商专有块），`raw` 是原始对象，
-  转回去时原样输出。`tokens` 是它的成本；调用方知道时直接填上，否则由计数器按种类和 adapter 在转换时取出的中立度量估（§4）：
-  `text`（thinking 块、文本文档自己的文字）、`pages`（PDF 页数，转换时数一次）。`tokens is None` 就是"估算的"；**永远不对 `raw` 跑文本计数**（base64 会被算成几十倍）。报告列出每个
-  估算出来的 `Opaque`。
-- **thinking 块不能改**：Anthropic 要求带 tool_use 的那一轮的签名 thinking 块原样回传。任何步骤都不 mask、不截断
-  `kind="thinking"`；它们只按 lite-agent §6 的规则在最近一次 `Compaction` 之前整体去掉。
-- **配对**：tool call 和它的结果用 `id` / `call_id` 配对。一次 assistant 消息里的多个 call 是一个**批次**，它们的结果
-  可能分在连续几条消息里（OpenAI 每个结果一条 `role: tool`）。§5 的每一步都以整个批次为单位，不拆开。
-- **轮**：一轮从一条带 `Text`、不带 `ToolResult` 的 user 消息开始（人说的话），到下一条这样的消息之前。只装 tool
-  结果的 user 消息不开始新的一轮。`DropOldest`、`plan_compaction` 都用这个定义。
-- **不完整的配对**：最后一个批次的结果还没到（loop 中途调用 `fit()`）是正常的，原样输出。除此之外，没有结果的
-  call、没有 call 的结果、同一个 call 的第二个结果都是输入错误：`fit()` 抛 `BrokenPairing`，不猜、不补。一个批次
-  还有 call 没回答时，下一条消息必须是带 tool 结果的消息（两家 API 都这样要求），所以批次不会被一句人话从中间
-  隔开，按轮切也就不会拆开批次。
+- `extra` holds fields the core does not care about but that must be carried back unchanged when converting to
+  the vendor format: `cache_control`, OpenAI's `name`, `tool_calls: []`, extra fields inside `function`. The core
+  does not read it, only carries it; a masked part keeps no original text other than `extra`.
+- `content_form` records the original form of content (a string, a list, `null`, the key absent). It is a typed
+  field rather than a conventional key in `extra`, and C1's steps keep it with `dataclasses.replace` when they
+  replace content. When it is `None` (built by hand), a single `Text` with no `extra` is output as a string, and
+  anything else is output as a list.
+- **Shared, not copied**: adapters do not deep-copy. `Opaque.raw` and the nested objects in `extra`
+  (`cache_control` and so on) are the same object across input, neutral messages and output; this is deliberate
+  (large images and PDFs are not copied). Convention: neither the caller nor lite-context mutates them, and to
+  change one, copy it first. lite-context itself never mutates its input (every adapter test checks that the
+  input is unchanged).
+- The system prompt and tool definitions are not `Message`s: they are passed to `fit()` as `fixed` text (or
+  directly as a token count), counted in the budget and never trimmed.
+- `Opaque` keeps content the adapter does not recognise or should not touch (images, PDFs, thinking blocks,
+  vendor-specific blocks) as it is; `raw` is the original object and is output unchanged when converting back.
+  `tokens` is its cost; when the caller knows it, it fills it in, otherwise the counter estimates it by kind and
+  by the neutral measures the adapter pulled out during conversion (§4): `text` (a thinking block, or the text of
+  a text document), `pages` (a PDF's page count, counted once during conversion). `tokens is None` means
+  "estimated"; **never run the text counter on `raw`** (base64 would be counted dozens of times too high). The
+  report lists every `Opaque` that was estimated.
+- **A thinking block cannot be changed**: Anthropic requires the signed thinking block of a turn that has a
+  tool_use to be sent back unchanged. No step masks or truncates `kind="thinking"`; they are removed only as a
+  whole, before the most recent `Compaction`, under lite-agent §6's rule.
+- **Pairing**: a tool call and its result are paired by `id` / `call_id`. Several calls in one assistant message
+  are one **batch**, and their results may be spread over several consecutive messages (OpenAI uses one
+  `role: tool` message per result). Every step of §5 works on a whole batch and never splits it.
+- **Turn**: a turn starts at a user message that has `Text` and no `ToolResult` (something a person said) and
+  runs up to the next such message. A user message that holds only tool results does not start a new turn.
+  `DropOldest` and `plan_compaction` both use this definition.
+- **Incomplete pairing**: it is normal for the last batch's results not to have arrived yet (`fit()` is called
+  in the middle of a loop), and it is output unchanged. Apart from that, a call with no result, a result with no
+  call, and a second result for the same call are all input errors: `fit()` raises `BrokenPairing`, and does not
+  guess or fill in. While a batch still has an unanswered call, the next message must be one that carries tool
+  results (both APIs require this), so a batch is never separated in the middle by something a person said, and
+  cutting by turn therefore never splits a batch.
 
-### 3.2 Adapter
+### 3.2 Adapters
 
-一个 adapter 是一对函数：`to_messages(native) -> list[Message]`、`from_messages(list[Message]) -> native`。
+An adapter is a pair of functions: `to_messages(native) -> list[Message]` and
+`from_messages(list[Message]) -> native`.
 
-| Adapter | 位置 | 说明 |
+| Adapter | Location | Notes |
 | --- | --- | --- |
-| `anthropic` | 核心（只处理 dict，不 import SDK） | Messages API 的 `messages` 数组（system 在 Anthropic 里本来就是单独的参数）：string content、`text` / `tool_use`（`input` 必须是能原样往返的纯 JSON 对象：没有非字符串键、tuple、NaN / Infinity）/ `tool_result` 块（`tool_result` 的 content 可以是字符串或块列表，`is_error`）、`cache_control`；其它块（`image`、`document`、`thinking`、`redacted_thinking` …）变 `Opaque` |
-| `openai` | 核心（只处理 dict） | Chat Completions 的完整 `messages` 列表：`system` / `developer` 消息拆出来作为 `fixed` 返回并在转回时放回原位；assistant 的 `tool_calls`（只接受 `type: "function"`；`arguments` 原样进 `raw_args`；`tool_calls` 为 `null` 或 `[]` 时原样保留，SDK 的 `model_dump()` 会给出 `null`）、`content: null` 或没有 content；每条 `role: tool` 消息变一条只含一个 `ToolResult` 的 user 消息，转回时还是各自一条 |
-| `lite_model` | extra `lite-model` | lite-model 的 turn 类型；版本跟 workspace 的 lite-model pin |
-| 宿主自有类型 | 宿主里写 | 约 30 行；lite-context 文档里给一个例子 |
+| `anthropic` | core (handles dicts only, does not import the SDK) | The Messages API `messages` array (system is already a separate parameter in Anthropic): string content, `text` / `tool_use` (`input` must be a plain JSON object that round-trips unchanged: no non-string keys, tuples, NaN / Infinity) / `tool_result` blocks (a `tool_result`'s content can be a string or a list of blocks, `is_error`), `cache_control`; other blocks (`image`, `document`, `thinking`, `redacted_thinking` …) become `Opaque` |
+| `openai` | core (handles dicts only) | The full Chat Completions `messages` list: `system` / `developer` messages are split out and returned as `fixed` and put back in place on the way back; the assistant's `tool_calls` (only `type: "function"` is accepted; `arguments` goes into `raw_args` verbatim; `tool_calls` that is `null` or `[]` is kept as it is, and the SDK's `model_dump()` produces `null`), `content: null` or no content; each `role: tool` message becomes one user message holding a single `ToolResult`, and on the way back it is again one message each |
+| `lite_model` | extra `lite-model` | lite-model's turn types; the version follows the workspace's lite-model pin |
+| A host's own types | written in the host | About 30 lines; lite-context's docs give an example |
 
-规则：**往返无损**。对上表写明的输入范围，`from_messages(to_messages(x)) == x`，`Opaque` 块逐字节原样回来。
-每个 adapter 都有这条性质测试，并且下面每种情况各有一个具名用例：字符串 content 与单个 text 块；`cache_control`
-在块上和消息上；`tool_result` 的 content 是块列表（文字加图片）、`is_error`；格式错误的 `arguments` 字符串；
-`content: null` 与 `""`；一个批次的多条 `role: tool`；`name` 字段；`system` / `developer` 的位置。表外的输入
-（不认识的 role 等）抛 `UnsupportedInput`，不尽力转换。`key` / `pinned` 不在厂商格式里，由调用方在转换后设置
-（`with_keys()` 辅助函数）；pin 一个 call 时它所在的整个批次和结果一起 pin。
+Rule: **round trips are lossless**. For the input range the table above states, `from_messages(to_messages(x))
+== x`, and `Opaque` blocks come back byte for byte. Every adapter has a property test for this, and each of the
+following cases has a named case: string content and a single text block; `cache_control` on a block and on a
+message; a `tool_result` whose content is a list of blocks (text plus image), `is_error`; a malformed
+`arguments` string; `content: null` and `""`; several `role: tool` messages of one batch; the `name` field; the
+position of `system` / `developer`. Input outside the table (an unknown role and so on) raises
+`UnsupportedInput`, with no best-effort conversion. `key` / `pinned` are not in the vendor formats and are set
+by the caller after conversion (the `with_keys()` helper); pinning a call pins its whole batch, results included.
 
-OpenAI 的 tool 消息没有错误标记，`ToolResult.is_error` 转成 OpenAI 格式时不出现。OpenAI adapter 的
-`Converted.fixed_texts()` 把 system / developer 消息变成 `fit(fixed=...)` 要的文本。一条中立 user 消息里混着
-tool 结果和别的内容时，OpenAI 输出按原顺序分段：每个结果一条 tool 消息，每段其它内容一条 user 消息。
+OpenAI's tool messages have no error flag, so `ToolResult.is_error` does not appear when converting to the
+OpenAI format. The OpenAI adapter's `Converted.fixed_texts()` turns the system / developer messages into the
+text `fit(fixed=...)` wants. When a neutral user message mixes tool results with other content, the OpenAI
+output is split in the original order: one tool message per result, one user message per run of other content.
 
-## 4. 计数与预算
+## 4. Counting and budget
 
 ```python
 class Counter(Protocol):
@@ -171,36 +215,53 @@ TiktokenCounter(encoding="o200k_base", ...)                             # extra 
 Budget(limit: int, reserve_output: int)   # limit = the model's input window as the caller decides it
 ```
 
-- 默认计数器是估算（字符数 / 3.5），与宿主 A 现在的做法一致；宿主 B 可以换成 tiktoken。厂商 SDK 的 count_tokens
-  是一次网络调用，不进核心（§15）。要精确时用**校准**（v0.3.2）：宿主对整篇文本做一次自己的精确计数，
-  `CharEstimate().calibrated(text, tokens)` 给出按这个比例算的估算（其它参数不变），交给 `split(counter=...)`、
-  `pack` / `select` / `reduce_tree` 的 `cost`——一篇文档一次网络调用，而不是每段一次；不另做一套 async 接口。
-  `text()` 先把商四舍五入到 9 位小数再向上取整：校准出来的比例（7 / 3）会让 7 / (7 / 3) 得到 3.0000000000000004，
-  必须算成 3（属性测试找到的）；默认的 3.5 下商都是 1/7 的倍数，结果不变。
-- `tokens` 不为 `None` 时直接用，计数器不被调用（`count_message` 里判断，每个 `Counter` 不用各自记得）。否则
-  `CharEstimate.opaque()` 只看 `kind` 和中立度量，从不读 `raw`：`image` 1600；有 `pages` 时页数 × 2000；有 `text`
-  时数文字；其它（`redacted_thinking`、读不出页数的 PDF、未知块）用默认值 1500。几个数都是构造参数。
-  adapter 取度量：Anthropic 的 `thinking` 文本、文本来源的 `document`、base64 PDF（数 `/Type /Page`）；OpenAI 的
-  `file` 部分里 `data:application/pdf;base64,` 开头的 `file_data`。页数按这个顺序数（v0.3.2）：文件里看得见的
-  `/Type /Page`；没有时解压 FlateDecode 流（PDF 1.5 的 `ObjStm` 把页对象放在里面）再数，解压总量最多 64 MiB
-  （`MAX_INFLATED`，解压炸弹最多花这么多）、解不开的流跳过；还没有就取页树节点（`/Type /Pages`）里最大的 `/Count`
-  （大纲的 `/Count` 不算）；都没有才是 `None`、落到默认值。不按文件大小猜（规则 12）。增量更新过的文件可能多数。
-  都只影响估算，不影响内容。每一步对文件都是线性的：流按 `stream` 关键字找下一个 `endstream`（前面有没有换行都行），
-  `stream` 前面必须是分隔符（空白或 `>`），所以 `endstream`、`upstream` 不算开头。页树节点在 `/Type /Pages` 前后 4 KiB
-  里按嵌套找所在的字典，只读它自己这一层的 `/Count`（`/Resources << /Count 99 >>` 这类嵌套字典里的不算）；每次查找
-  从上一次停下的地方接着找，一个节点只扫一遍窗口；最多看 1000 个节点（9 MB 全是节点的文件 0.06 秒，不设上限 0.60 秒）。
-  局限（只影响估算）：页树字典超过 4 KiB（扁平的根节点挂了上千个 `/Kids`）、字符串里有 `>>` 时数不出，落到默认值；
-  有一页看得见、其余在压缩流里的增量更新文件按看得见的算（与 v0.3.1 相同）。
-  第一版用了两个正则，review 发现输入不大就是平方级（280 KB 要 68 秒）；第二版的字典查找每步重扫整个窗口，0.07 MB
-  的构造输入要 6 秒——都改掉了，构造的最坏输入现在都在 0.1 秒内。
-- `CharEstimate` 的参数必须为正（`chars_per_token`）或不为负（其它）；`fixed` 里的 token 数必须是非负的 int
-  （`bool` 不算），否则 `ValueError`。
-- `TiktokenCounter` 推迟到 C4、宿主 B 接入时做：tiktoken 第一次用时从网络下载编码文件，和"测试不联网"冲突，需要
-  先定下编码文件怎么随包提供；宿主 B 也可以直接实现 `Counter` 协议。
-- 预算判断用估算，记账用厂商返回的 usage（宿主 A 的决策 D-10 也是这样）。报告里的数字标明是估算。
-- 可用量 = `limit - reserve_output - fixed`。`fixed` 本身就超出时直接 `DoesNotFit`，不做任何裁剪。
+- The default counter is an estimate (characters / 3.5), the same as what host A does today; host B can switch
+  to tiktoken. A vendor SDK's count_tokens is a network call and does not go into the core (§15). When you need
+  exact numbers, use **calibration** (v0.3.2): the host makes one exact count of a whole text itself,
+  `CharEstimate().calibrated(text, tokens)` gives an estimate at that ratio (other parameters unchanged), and you
+  hand it to `split(counter=...)` and to the `cost` of `pack` / `select` / `reduce_tree` — one network call per
+  document, not one per piece; there is no separate async interface. `text()` first rounds the quotient to 9
+  decimal places and then rounds up: a calibrated ratio (7 / 3) makes 7 / (7 / 3) come out as 3.0000000000000004,
+  which must be counted as 3 (found by a property test); with the default 3.5 every quotient is a multiple of
+  1/7, so the result does not change.
+- When `tokens` is not `None` it is used directly and the counter is not called (checked in `count_message`, so
+  each `Counter` does not have to remember it). Otherwise `CharEstimate.opaque()` looks only at `kind` and the
+  neutral measures and never reads `raw`: `image` 1600; with `pages`, pages × 2000; with `text`, count the text;
+  anything else (`redacted_thinking`, a PDF whose pages cannot be read, an unknown block) uses the default 1500.
+  These numbers are all constructor parameters. The adapters take the measures: Anthropic's `thinking` text, a
+  `document` with a text source, a base64 PDF (counting `/Type /Page`); OpenAI's `file` parts whose `file_data`
+  starts with `data:application/pdf;base64,`. Page counts are taken in this order (v0.3.2): the `/Type /Page`
+  visible in the file; if there is none, inflate the FlateDecode streams (a PDF 1.5 `ObjStm` holds the page
+  objects inside) and count again, with a total inflated size of at most 64 MiB (`MAX_INFLATED`, the most a
+  decompression bomb can cost) and streams that cannot be inflated skipped; if there is still none, take the
+  largest `/Count` among the page-tree nodes (`/Type /Pages`) (an outline's `/Count` does not count); only if
+  there is none is it `None`, falling back to the default. No guessing from file size (rule 12). A file with
+  incremental updates may be over-counted. All of this affects only the estimate, not the content. Every step is
+  linear in the file: a stream is found by the `stream` keyword and the next `endstream` (a newline before it or
+  not, either works), `stream` must be preceded by a delimiter (whitespace or `>`), so `endstream` and
+  `upstream` do not count as a start. For a page-tree node, the dictionary that contains it is found by nesting
+  in the 4 KiB before and after `/Type /Pages`, and only the `/Count` at its own level is read (one inside a
+  nested dictionary such as `/Resources << /Count 99 >>` does not count); each search continues from where the
+  last one stopped, so a node scans the window once; at most 1000 nodes are looked at (a 9 MB file made entirely
+  of nodes takes 0.06 seconds, 0.60 seconds without the cap). Limits (affecting only the estimate): when a
+  page-tree dictionary is over 4 KiB (a flat root node with thousands of `/Kids`) or a string contains `>>`, it
+  cannot be counted and falls back to the default; a file with incremental updates where one page is visible and
+  the rest are in compressed streams is counted by the visible one (the same as v0.3.1).
+  The first version used two regular expressions, and review found them quadratic even on small input (68
+  seconds for 280 KB); the second version's dictionary search rescanned the whole window at every step, taking 6
+  seconds on 0.07 MB of constructed input — both were fixed, and the worst constructed inputs now all finish in
+  under 0.1 seconds.
+- `CharEstimate`'s parameters must be positive (`chars_per_token`) or not negative (the others); a token count in
+  `fixed` must be a non-negative int (`bool` does not count), otherwise `ValueError`.
+- `TiktokenCounter` is postponed to C4, when host B is adopted: tiktoken downloads its encoding file from the
+  network on first use, which conflicts with "tests do not touch the network", and how the encoding file ships
+  with the package has to be decided first; host B can also implement the `Counter` protocol directly.
+- The budget decision uses estimates, and accounting uses the usage the vendor returns (host A's decision D-10
+  does the same). Numbers in the report are marked as estimates.
+- Available amount = `limit - reserve_output - fixed`. If `fixed` alone is over the limit, raise `DoesNotFit`
+  straight away without any trimming.
 
-## 5. 历史：`fit()`
+## 5. History: `fit()`
 
 ```python
 fitted = fit(
@@ -217,72 +278,95 @@ fitted.report          # tokens before / after, every action taken, compaction_d
 # raises DoesNotFit(report) when every step has run and it still does not fit
 ```
 
-### 5.1 流程
+### 5.1 Flow
 
-1. 有 `state.compaction` 时先应用它（§6.2）：被覆盖的消息换成一条摘要消息。
-2. 按 `state` 里记下的切点重放上次的削减（§5.4）。
-3. **常驻步骤**（`always=True`，如 `TruncateToolResults`）对每条消息都执行，不看是否超预算。它对同一条消息的结果
-   永远一样，所以不会破坏 prompt cache 的前缀。
-4. 仍超出高水位时，按顺序执行**削减步骤**，每一步都削到低水位（`target`，默认预算的 70%）为止，没超就跳过；
-   新的切点写进返回的 `state`。
-5. 全部执行完仍超预算 → `DoesNotFit`；报告里有每一步做了什么。
-6. 高水位默认 = 预算的 90%。`report.compaction_due` 在第 1–4 步**之后**计算：应用了现有摘要和全部削减、仍超过
-   高水位时为真，提示调用方该写新摘要了（§6）。
+1. If there is a `state.compaction`, apply it first (§6.2): the covered messages are replaced by one summary
+   message.
+2. Replay the previous cuts using the cut points recorded in `state` (§5.4).
+3. **Standing steps** (`always=True`, such as `TruncateToolResults`) run on every message, whether or not the
+   budget is exceeded. Their result for a given message is always the same, so they do not break the prompt
+   cache prefix.
+4. If it is still over the high-water mark, run the **cutting steps** in order. Each step cuts until the
+   low-water mark (`target`, 70% of the budget by default) and is skipped if the total is not over; the new cut
+   points are written into the returned `state`.
+5. If it is still over budget after everything has run → `DoesNotFit`; the report says what each step did.
+6. The high-water mark is 90% of the budget by default. `report.compaction_due` is computed **after** steps 1–4:
+   it is true when, with the existing summary and all cuts applied, the total is still over the high-water mark,
+   and it tells the caller that a new summary should be written (§6).
 
-### 5.2 不变的规则（每条都有测试）
+### 5.2 Invariant rules (each has a test)
 
-1. 输入的 `messages` 和 `state` 不被修改；同样的输入得到同样的输出（纯函数）。
-2. 一个批次的 `ToolCall` 和它们的 `ToolResult` 要么都在，要么都不在；mask 只换结果的内容，不删配对。
-   不完整的配对按 §3.1 处理。
-3. `pinned` 的消息永不被 mask、drop 或摘要覆盖。
-4. 最后一轮的人话（最后一条带 `Text`、不带 `ToolResult` 的 user 消息）永不被动。最新的 tool 结果**不受**这条
-   保护：常驻步骤可以截断它，并写进报告；否则一个超大的结果会让每次调用都 `DoesNotFit`。
-5. 报告列出每个被动过的消息（`key`，没有 key 时用位置）、动作和省下的 token；没被列出的消息与输入逐字节相同。
-   这条在运行时检查：每个步骤执行后，`fit()` 比对它的输入和输出，有被改或被删、却不在这个步骤报告里的消息就抛
-   `UnreportedChange`。宿主自己写的步骤同样受这个检查。
-6. 每个占位文本是固定的、写在步骤里的常量，测试逐字比对。
-7. `kind="thinking"` 的 `Opaque` 不被任何步骤改动（§3.1）。
+1. The input `messages` and `state` are not modified; the same input gives the same output (pure function).
+2. A batch's `ToolCall`s and their `ToolResult`s are either all present or all absent; masking replaces only the
+   content of a result and never deletes the pairing. Incomplete pairings are handled as in §3.1.
+3. `pinned` messages are never masked, dropped or covered by a summary.
+4. The human message of the last turn (the last user message that has `Text` and no `ToolResult`) is never
+   touched. The newest tool result is **not** covered by this protection: a standing step may truncate it and
+   write that into the report; otherwise one oversized result would make every call `DoesNotFit`.
+5. The report lists every message that was touched (`key`, or the position when there is no key), the action and
+   the tokens saved; a message that is not listed is byte-for-byte the same as in the input. This is checked at
+   runtime: after each step, `fit()` compares the step's input and output, and if a message was changed or
+   removed but is not in that step's report it raises `UnreportedChange`. Steps written by a host are subject to
+   the same check.
+6. Every placeholder is a fixed constant written in the step, and tests compare it byte for byte.
+7. An `Opaque` with `kind="thinking"` is not changed by any step (§3.1).
 
-### 5.3 步骤
+### 5.3 Steps
 
-| 步骤 | 类型 | 做什么 |
+| Step | Type | What it does |
 | --- | --- | --- |
-| `TruncateToolResults(max_tokens, keep="head" \| "head_tail")` | 常驻 | 超长的 tool 结果截到上限，加 `[cut: N more characters not shown]`；加上标记反而更长时不截。上限按整个结果算：一个结果有几段文字时，超了就用换行把它们接成一段（位置和 `extra` 用第一段的）再截；`head_tail` 的尾部只从头部剩下的部分里取，两段不会重叠 |
-| `MaskToolResults(keep_last=N)` | 削减 | 从最旧的**批次**开始，把批次里每个 tool 结果的内容换成 `[result cleared to save context; call {name} again if you need it]`，最近 N 个批次不动；结果里的图片一并换掉 |
-| `MaskOpaque(keep_last=N)` | 削减 | 旧的 `image` / `document` 块（消息里的，和 tool 结果里的）换成 `[{kind} removed to save context]`（宿主 B 现在对附件的做法）；不碰 `thinking`。单位是"一条带图片或文档的消息"，一条消息里的都一起削；`keep_last` 数的是最近几条这样的消息 |
-| `DropOldest(keep_last_turns=N)` | 削减 | 删掉最旧的整轮（§3.1 的定义，所以批次不会被拆开），在第一条被删消息的位置留一条 `[N earlier messages not shown]`（N 是删掉的消息数）。含受保护消息的轮不删。默认不在步骤里，调用方明确要才加 |
+| `TruncateToolResults(max_tokens, keep="head" \| "head_tail")` | standing | Cuts an over-long tool result to the limit and adds `[cut: N more characters not shown]`; it does not cut when adding the marker would make it longer. The limit is applied to the whole result: when a result has several pieces of text and it is over, they are joined with newlines into one piece (position and `extra` taken from the first piece) and then cut; the tail of `head_tail` is taken only from what the head leaves, so the two parts never overlap |
+| `MaskToolResults(keep_last=N)` | cutting | Starting from the oldest **batch**, replaces the content of every tool result in the batch with `[result cleared to save context; call {name} again if you need it]`, leaving the most recent N batches alone; images in a result are replaced too |
+| `MaskOpaque(keep_last=N)` | cutting | Old `image` / `document` blocks (in messages, and in tool results) are replaced with `[{kind} removed to save context]` (what host B does for attachments today); `thinking` is not touched. The unit is "one message that carries an image or document", and everything in one message is cut together; `keep_last` counts the most recent such messages |
+| `DropOldest(keep_last_turns=N)` | cutting | Deletes the oldest whole turn (the definition in §3.1, so a batch is never split) and leaves `[N earlier messages not shown]` at the position of the first deleted message (N is the number of deleted messages). A turn that contains a protected message is not deleted. It is not in the steps by default; it is added only when the caller asks for it explicitly |
 
-所有步骤都不碰受保护的消息（pinned 的、最后一轮人话那一条）。
+No step touches a protected message (a pinned one, or the human message of the last turn).
 
-**宿主自己的步骤**（C1a 实现的协议）：步骤在 `Entry(ref, message)` 上工作，`ref` 是调用方的 key，没有 key 时是
-输入里的位置 `#i`，新插入的消息用自己的 ref（如 `+drop_oldest`）。
+**A host's own steps** (the protocol C1a implements): a step works on `Entry(ref, message)`, where `ref` is the
+caller's key, or the position `#i` in the input when there is no key, and a newly inserted message uses its own
+ref (such as `+drop_oldest`).
 
-- 常驻步骤（`AlwaysStep`）：`name`、`always = True`、`apply(entries, ctx) -> (entries, actions)`。
-- 削减步骤（`CuttingStep`）：`name`、`always = False`、`units(entries, ctx) -> [Unit]`（从旧到新、可以削的单位，
-  `Unit.refs` 是它覆盖的消息；`Unit.at` 是步骤自己的定位）、`apply(entries, units, ctx)`（只削给它的这几个单位）。
-  `fit()` 决定削几个：先重放 `state` 里切点及之前的单位，超过高水位时再往后加到低水位。加的时候只停在消息的边界上
-  （同一条消息的几个单位一起削，因为切点记的是整条消息）；不假设"削得越多越省"（占位可能比原文长）：一次把所有
-  单位都削掉、从被动过的消息算出每个单位省多少，用累加和估出每个个数的总数，取最少能到低水位的个数，到不了就取
-  最省的那个；再真正削一次、精确地数，估少了就往后试。都不如重放省的话保持重放。
-- `StepContext` 给出计数器和受保护的 ref。
-- 每个步骤执行后 `fit()` 检查：受保护的消息和 thinking 块没变（`ProtectedChange`）；没报告的消息原样、原序都在，
-  新增的消息都报告了（`UnreportedChange`）；配对仍然完整（`BrokenPairing`）。
-- 每个候选输出都要检查，包括 `fit()` 二分查找时试过、最后没用上的，所以违反规则的步骤一定会被发现。
-- `lite_context.testing.check_step(step)` 把宿主的步骤放进 `fit()`，在几段样例对话（并行批次、没完成的批次、
-  pinned、图片、thinking）和几个预算上跑，检查上面这些规则、两次调用结果相同、输入没变；再把每段对话一轮一轮
-  条地加长（三个预算）、每次传回 `state`，检查切点没动的那几次，上一次的请求是这一次的前缀（cache 不被破坏；刚离开
-  保护的那条消息除外，§5.4）；再跑一次没有 key 的历史。返回步骤实际改动过的次数。样例里有单独的图片、一条消息里
-  两张图片、并行批次里每个结果各带一张图片。
+- Standing step (`AlwaysStep`): `name`, `always = True`, `apply(entries, ctx) -> (entries, actions)`.
+- Cutting step (`CuttingStep`): `name`, `always = False`, `units(entries, ctx) -> [Unit]` (the units that can be
+  cut, oldest to newest; `Unit.refs` are the messages it covers; `Unit.at` is the step's own locator),
+  `apply(entries, units, ctx)` (cuts only the units it is given). `fit()` decides how many to cut: it first
+  replays the units at and before the cut point in `state`, and when still over the high-water mark it adds more
+  going forward until the low-water mark. When adding it stops only at message boundaries (the several units of
+  one message are cut together, because a cut point records a whole message); it does not assume "the more cut,
+  the more saved" (a placeholder can be longer than the original): it cuts all the units at once, works out from
+  the messages that were touched how much each unit saves, estimates the total for each count with a running
+  sum, takes the smallest count that reaches the low-water mark (or, if none does, the count that saves the
+  most); then it really cuts once more and counts exactly, and if the estimate was too low it tries going
+  further. If none of this beats the replay, the replay is kept.
+- `StepContext` gives the counter and the protected refs.
+- After each step `fit()` checks: protected messages and thinking blocks are unchanged (`ProtectedChange`);
+  messages not reported are all present, unchanged and in the same order, and every added message was reported
+  (`UnreportedChange`); pairings are still complete (`BrokenPairing`).
+- Every candidate output is checked, including the ones `fit()` tried during its binary search and did not end
+  up using, so a step that breaks a rule is always found.
+- `lite_context.testing.check_step(step)` puts a host's step into `fit()` and runs it over several sample
+  conversations (parallel batches, an unfinished batch, pinned, images, thinking) and several budgets, checking
+  the rules above, that two calls give the same result, and that the input is unchanged; then it grows each
+  conversation one turn at a time (three budgets), passing `state` back each time, and checks that on the calls
+  where the cut point did not move, the previous request is a prefix of this one (the cache is not broken; the
+  message that just left protection is the exception, §5.4); then it runs once more on a history without keys.
+  It returns the number of times the step actually changed something. The samples include a lone image, two
+  images in one message, and a parallel batch where each result carries one image.
 
-### 5.4 状态：为什么削减要记下来
+### 5.4 State: why the cuts are recorded
 
-`fit()` 是纯函数，只看输入。如果不记下上次削到了哪里，原始历史一旦超过高水位，之后每一轮都会重新削到低水位，
-而历史每轮都在变长，于是每轮都多 mask 一条旧消息，prompt cache 每轮都从那里失效。所以每个削减步骤的结果是一个
-**切点**：它削到了输入里的哪一条消息（`through`），加上输入从开头到这条消息的 ref 的摘要值。重放时，这个步骤
-在 `through` 及之前的所有单位都削掉。切点按位置而不按"前几个单位"记：前面的步骤删掉了某些单位，或者某条消息
-离开了保护（最后一轮人话换了一条），单位列表会变，但位置不变，所以不会误报 `StaleState`（C1a review 发现）。
-代价：离开保护的那张旧图片会在下一次重放时被削掉，旧消息因此改动一次。单位的先后由 `fit()` 按输入位置排，
-不依赖步骤列出的顺序。切点存在 `ContextState` 里：
+`fit()` is a pure function and looks only at its input. If it does not record how far the previous call cut,
+then once the raw history goes over the high-water mark, every later turn would cut down to the low-water mark
+again, and since the history grows every turn, every turn would mask one more old message, and the prompt cache
+would be invalidated from that point every turn. So the result of each cutting step is a **cut point**: which
+message in the input it cut through (`through`), plus a digest of the refs of the input from the start up to
+that message. On replay, the step cuts all its units at and before `through`. A cut point is recorded by
+position, not as "the first few units": earlier steps may have deleted some units, or a message may have left
+protection (the human message of the last turn was replaced by another), so the list of units changes but the
+position does not, and so `StaleState` is not raised by mistake (found in C1a review). The cost: the old image
+that left protection is cut at the next replay, so an old message changes once because of that. `fit()` orders
+the units by their position in the input and does not depend on the order in which a step lists them. The cut
+points are kept in `ContextState`:
 
 ```python
 @dataclass(frozen=True)
@@ -291,19 +375,26 @@ class ContextState:
     compaction: Compaction | None # C1b
 ```
 
-- 下一次调用传回 `state`：已有的切点原样重放；只有在重放后仍超过高水位时，切点才往前推。切点只往前，不后退。
-- 往前推的切点如果让总数反而变大（`DropOldest` 的占位比删掉的几条短消息还长），就不采用，保持重放的结果。
-- 调用方把 `state` 存在历史旁边（`to_json()` / `from_json()`，一列 JSON 即可；格式带版本号，不认识的版本报错）。
-  不传 `state` 等于从零开始，结果仍然正确，只是 cache 不稳定。
-- 切点和 `Compaction` 一样带被覆盖消息 key 的摘要值；历史在切点之前被改过时抛 `StaleState`（§6.2）。
-- **切点量的是应用摘要之后的历史**。一次新的压缩（§6.1 `accept`）返回的 `state` 不带切点：被摘要覆盖的单位已经
-  不在了，旧切点的摘要值对不上；而且压缩本身已经让 prompt cache 从开头失效，从零开始削不损失什么（C1a 收尾时定，
-  见阶段记录）。
-- key 不能以 `#` 或 `+` 开头（那是 lite-context 内部的 ref），否则 `ValueError`。
-- 切点要靠 key：消息没有 key 时 `fit()` 照样能削，但返回的 `state` 不记切点；带着切点的 `state` 配上没有 key 的
-  消息抛 `StaleState`。这一次调用的步骤里没有的切点不带进新 `state`。
+- Pass `state` back on the next call: existing cut points are replayed unchanged; a cut point moves forward
+  only when the total is still over the high-water mark after the replay. A cut point only moves forward, never
+  back.
+- If a cut point moved forward would make the total larger instead (`DropOldest`'s placeholder is longer than
+  the few short messages it deleted), it is not adopted and the replay result is kept.
+- The caller stores `state` next to the history (`to_json()` / `from_json()`, one JSON column is enough; the
+  format carries a version number, and an unknown version is an error). Not passing `state` is the same as
+  starting from zero: the result is still correct, only the cache is not stable.
+- Like `Compaction`, a cut point carries a digest of the keys of the messages it covers; when the history was
+  changed before the cut point, `StaleState` is raised (§6.2).
+- **A cut point measures the history after the summary is applied.** The `state` returned by a new compaction
+  (§6.1 `accept`) carries no cut points: the units covered by the summary are gone and the old cut points'
+  digests would not match; also, compaction itself already invalidates the prompt cache from the start, so
+  starting to cut from zero loses nothing (decided at the close of C1a, see the stage records).
+- A key cannot start with `#` or `+` (those are lite-context's internal refs), otherwise `ValueError`.
+- Cut points depend on keys: when messages have no key `fit()` can still cut, but the returned `state` records
+  no cut points; a `state` carrying cut points paired with messages that have no key raises `StaleState`. A cut
+  point for a step that is not among this call's steps is not carried into the new `state`.
 
-## 6. 摘要：`Compaction`
+## 6. Summary: `Compaction`
 
 ```python
 @dataclass(frozen=True)
@@ -315,9 +406,10 @@ class Compaction:
     created_at: str          # ISO 8601
 ```
 
-`Compaction` 存在 `ContextState.compaction` 里，和切点一起序列化（`to_json()` / `from_json()`）。
+A `Compaction` lives in `ContextState.compaction` and is serialised together with the cut points (`to_json()` /
+`from_json()`).
 
-### 6.1 写摘要
+### 6.1 Writing the summary
 
 ```python
 if fitted.report.compaction_due:
@@ -328,65 +420,85 @@ if fitted.report.compaction_due:
         store(new_state)                     # raises EmptySummary / TruncatedSummary instead
 ```
 
-- `plan.covered` 是摘要将代表的消息的 key（从 pinned 前缀之后算），`plan.covers_through` 是最后一个；覆盖范围的
-  终点永远是某一轮的开头（`keep_last_turns` 至少为 1，当前这一轮和没完成的批次永远不进摘要；轮数不比要保留的多、
-  或者没有人话的历史，都返回 None）。
-- `accept` 的 `provenance` 按 JSON 往返之后的样子保存（tuple 变 list），不是 JSON 的值立刻 `ValueError`，不等到
-  存储时才失败。
-- 便捷函数 `await acompact(messages, state=..., summarize=fn, policy=...)` 把三步合在一起；`fn(system, prompt)` 是
-  调用方给的 async 函数，返回 `Summary(text, truncated, provenance)`；没有新内容可覆盖时返回 None。
-- `accept` 返回的 `state` 只有新摘要、没有切点（§5.4）。
-- **覆盖范围**：从历史开头的 pinned 前缀（比如最初的任务说明）之后开始，到切点为止。范围里不能有 pinned 消息：
-  切点最远到下一条 pinned 消息之前，所以 pinned 消息永远留在原来的位置，顺序不变。
-- 切点只落在轮的边界上（§3.1），所以不会拆开批次。后一次压缩从头覆盖，把前一次的摘要也吃进去；被截断或为空的
-  摘要算失败，不能顶替历史。这几条沿用 lite-agent S3b。
-- **`SummaryPolicy` 是可替换的**：`keep_last_turns`、`render(previous, messages) -> (system, transcript)`、
-  `wrap(mark, reply) -> text`、`unwrap(text)`。`mark` 每个 plan 定一次、记在 plan 上，`wrap` 只去掉带这个 mark 的
-  头标行（任何字符串的 mark 都行）；前一次的摘要去掉前言再交给模型，免得前言被抄进新摘要、再套一层。`render_transcript(mark, messages)`（v0.3.1）给出不带结尾 `END` 的那一段，给自己拼提问的宿主用（lite-agent 的压缩器，C7）。默认 policy 照搬 lite-agent 实测过的做法（它的 §15 S3b）：transcript 的每一段以带随机
-  token 的头标开头（tool 结果里的文字冒充不了用户）；说明在 transcript 之后再说一遍（小模型否则会回答 transcript
-  里最后一个问题，6 次里 6 次）；去掉回复里抄进来的头标行；thinking 块不进 transcript，图片写成 `[image]`；前一次的
-  摘要作为第一段 `earlier summary` 放进去。`mark` 可以传入（测试用），默认每次随机。lite-agent 在 C7 提供它自己的
-  policy，从而保持它现有的行为。
-- 需要 `key`：没有 key 的历史不能压缩（报错）。key 只要求在一份历史里唯一，**不要求可比较**（UUID 也行）。
+- `plan.covered` is the keys of the messages the summary will stand for (counted from after the pinned prefix),
+  and `plan.covers_through` is the last one; the end of the covered range is always the start of some turn
+  (`keep_last_turns` is at least 1, and the current turn and an unfinished batch never go into the summary; if
+  there are no more turns than the number to keep, or a history with no human messages, None is returned).
+- `accept` stores `provenance` as it looks after a JSON round trip (tuples become lists); a value that is not
+  JSON raises `ValueError` at once, rather than failing only when it is stored.
+- The convenience function `await acompact(messages, state=..., summarize=fn, policy=...)` combines the three
+  steps; `fn(system, prompt)` is an async function from the caller and returns `Summary(text, truncated,
+  provenance)`; it returns None when there is nothing new to cover.
+- The `state` returned by `accept` has only the new summary and no cut points (§5.4).
+- **Covered range**: it starts after the pinned prefix at the start of the history (for example the initial task
+  statement) and ends at the cut point. There can be no pinned message in the range: the cut point goes at most
+  as far as before the next pinned message, so pinned messages always stay where they were, in the same order.
+- The cut point falls only on a turn boundary (§3.1), so it never splits a batch. A later compaction covers from
+  the start and takes the previous summary in too; a truncated or empty summary counts as a failure and cannot
+  stand in for the history. These rules follow lite-agent S3b.
+- **`SummaryPolicy` is replaceable**: `keep_last_turns`, `render(previous, messages) -> (system, transcript)`,
+  `wrap(mark, reply) -> text`, `unwrap(text)`. `mark` is fixed once per plan and recorded on the plan, and `wrap`
+  removes only the header line that carries this mark (a mark can be any string); the previous summary is given
+  to the model with its preamble removed, so the preamble is not copied into the new summary and wrapped
+  another layer deep. `render_transcript(mark, messages)` (v0.3.1) gives the part without the closing `END`, for
+  hosts that assemble their own prompt (lite-agent's compactor, C7). The default policy copies what lite-agent
+  measured (its §15 S3b): every segment of the transcript starts with a header that carries a random token (text
+  inside a tool result cannot impersonate the user); the instructions are said again after the transcript (a
+  small model otherwise answers the last question in the transcript, 6 times out of 6); header lines copied into
+  the reply are removed; thinking blocks do not go into the transcript and images are written as `[image]`; the
+  previous summary goes in as the first segment, `earlier summary`. `mark` can be passed in (for tests) and is
+  random each time by default. lite-agent provides its own policy in C7, so that it keeps its current behaviour.
+- `key` is required: a history without keys cannot be compacted (an error). A key only has to be unique within
+  one history and **does not have to be comparable** (a UUID is fine).
 
-### 6.2 应用摘要
+### 6.2 Applying the summary
 
-`fit(..., state=s)`，`s.compaction = c`。应用摘要在 `fit()` 里是一个内部步骤：它像别的步骤一样报告动作（被覆盖的
-消息 `summarised`、摘要消息 `inserted`），经过同一个运行时检查，不另写一份规则：
+`fit(..., state=s)`, `s.compaction = c`. Applying the summary is an internal step in `fit()`: like other steps it
+reports its actions (the covered messages `summarised`, the summary message `inserted`) and goes through the
+same runtime check, with no separate set of rules:
 
-1. 找到 `c.covers_through` 的位置；找不到 → `StaleState`。
-2. 从 pinned 前缀之后到这个位置的消息，它们 key 的摘要值必须等于 `c.covered_digest`（条数变了摘要值也会变，所以
-   不另存条数，C1b 收尾时去掉了 `covered_count`）；
-   不相等（切点之前有消息被插入、删除或改了 key）→ `StaleState`。不悄悄套用一个过期的摘要。
-3. 这个位置必须是轮的边界，范围里不能有 pinned 消息；否则 → `StaleState`。
-4. 输出：pinned 前缀原样，然后一条 user 消息（内容就是 `c.text`，ref `+compaction`），然后切点之后的消息。只用
-   最近的一条 `Compaction`。之后的削减步骤在这个结果上工作，所以切点量的是摘要之后的历史（§5.4）。
-5. 消息没有 key 而 `state` 里有摘要 → `StaleState`。
+1. Find the position of `c.covers_through`; not found → `StaleState`.
+2. For the messages from after the pinned prefix up to this position, the digest of their keys must equal
+   `c.covered_digest` (if the count changes the digest changes too, so the count is not stored separately;
+   `covered_count` was removed at the close of C1b); if not equal (a message before the cut point was inserted,
+   deleted or had its key changed) → `StaleState`. A stale summary is never applied quietly.
+3. This position must be a turn boundary and there can be no pinned message in the range; otherwise →
+   `StaleState`.
+4. Output: the pinned prefix unchanged, then one user message (its content is `c.text`, ref `+compaction`),
+   then the messages after the cut point. Only the most recent `Compaction` is used. Later cutting steps work on
+   this result, so the cut points measure the history after the summary (§5.4).
+5. If the messages have no key but `state` has a summary → `StaleState`.
 
-摘要消息是一条 user 消息，后面通常紧跟着下一轮人话（也是 user），前面有 pinned 前缀时还会更多：连续的 user 消息。
-Anthropic 会把它们合并，OpenAI 接受；要求严格交替的后端（有些本地模型的 chat template）需要宿主自己合并。
+The summary message is a user message, usually followed directly by the next human message (also user), and when
+there is a pinned prefix before it there are more: consecutive user messages. Anthropic merges them and OpenAI
+accepts them; backends that require strict alternation (the chat templates of some local models) need the host
+to merge them itself.
 
-切点之前的消息**内容**被改过（key 不变）时检查不出来；这是调用方的约定：被摘要覆盖的消息不再修改。要改就丢掉
-`state`，重新压缩。
+A change to the **content** of a message before the cut point (with the key unchanged) cannot be detected; this
+is a convention on the caller: messages covered by a summary are not modified again. To change one, drop the
+`state` and compact again.
 
-## 7. 长文档与检索结果：`lite_context.docs`
+## 7. Long documents and retrieval results: `lite_context.docs`
 
-两个首批宿主各写了一遍的东西。模型调用都由调用方传入。规则来自 KB `global/map-reduce-llm-guide.md` §3 和宿主的
-实测：先数，装得下就原样一次调用（切分路径的 prompt 和调用与不切时完全一样）；reduce 按预算把相邻笔记分组、一层层
-合并，单条笔记合不了、合并结果超预算都让整个 reduce 失败，绝不退回到直接拼接；只有调用方判定为"太大被拒"的失败才
-对半拆，别的失败原样抛出。
+Things both first hosts wrote for themselves. The model call is always passed in by the caller. The rules come
+from KB `global/map-reduce-llm-guide.md` §3 and the hosts' measurements: count first, and if it fits make one
+call with the text as it is (on the split path the prompt and the call are exactly the same as without a split);
+reduce groups adjacent notes by budget and merges them level by level; a single note that cannot be merged, or a
+merge result over budget, makes the whole reduce fail, and it never falls back to plain concatenation; only a
+failure the caller judges to be "too large, rejected" is halved, and any other failure is raised as it is.
 
-| 函数 | 做什么 |
+| Function | What it does |
 | --- | --- |
-| `split(text, max_tokens=, counter=, overlap=0.06, prefer="\n", heading=None) -> [Piece]` | 装得下就是原样一段。否则在每个 `prefer` 之后断开成小段（超限的小段先截到限内），每个小段只数一次；一段取尽可能多的整个小段，再用一次真实计数核对（不可加的计数器超了就从尾部退）；下一段往回重叠约 `overlap`，也从小段边界开始。小段计数相加对子词分词器是往高估，是安全的方向（KB 指南 §3）；总计数量约为全文的 3 倍。`heading` 是一个正则：每段带上它开始所在章节的标题行（开在标题行上就是这个标题；宿主 B 实测：不带时，切开后 60 条里 60 条丢了所属章节） |
-| `pack(units, budget=, cost=, overhead=0) -> [[unit]]` | 把连续的单元按预算分组，不打乱顺序；单个单元自己就超预算时 `DoesNotFit` |
-| `await halving(items, call, too_large=, min_size=1) -> Halved(calls)` | 调 `call(items)`；`too_large(exc)` 为真时对半拆开、先后调用；别的失败、到 `min_size` 还被拒、取消（`BaseException`，不交给 `too_large`）都原样抛出。`calls` 按顺序记下每次成功调用读的范围和它的结果，`results` 是拼起来的结果。`min_size` 至少为 1。文本按行拆：传 `text.splitlines(keepends=True)` |
-| `await reduce_tree(notes, budget=, cost=, merge=, overhead=0, max_depth=8) -> Reduced(notes, levels)` | 一层层合并相邻笔记，直到能一起放进预算；返回的笔记由调用方用自己的最终 prompt 读（中间合并和最终 reduce 的 prompt 不同）。每层的组按顺序一个一个合并（限额账户上并发只会被拒）。没有进展、合并结果超预算、到 `max_depth` 都 `DoesNotFit` |
-| `select(chunks, budget=, cost=, key=) -> Selected(chosen, duplicates, over_budget)` | 在调用方已经排好序的检索结果里按顺序取、按 key 去重；第一条放不下就停，之后不重复的都进 `over_budget`、重复的进 `duplicates`（排名低的短块不会挤掉排名高的；三个列表恰好分完输入） |
+| `split(text, max_tokens=, counter=, overlap=0.06, prefer="\n", heading=None) -> [Piece]` | If it fits, one piece as it is. Otherwise break after each `prefer` into small segments (an over-limit segment is first cut down to the limit), counting each segment once; one piece takes as many whole segments as possible and is then checked with one real count (a counter that is not additive, if over, backs off from the tail); the next piece overlaps backwards by about `overlap`, also starting at a segment boundary. Adding up the segment counts overestimates for a subword tokenizer, which is the safe direction (KB guide §3); the total counting work is about 3 times the full text. `heading` is a regular expression: each piece carries the heading line of the section it starts in (if it starts on a heading line, that heading; host B measured: without it, 60 of 60 pieces lost their section after the split) |
+| `pack(units, budget=, cost=, overhead=0) -> [[unit]]` | Groups consecutive units by budget without reordering them; `DoesNotFit` when a single unit is over budget by itself |
+| `await halving(items, call, too_large=, min_size=1) -> Halved(calls)` | Calls `call(items)`; when `too_large(exc)` is true, halves and calls the two halves one after the other; any other failure, a rejection that is still there at `min_size`, and cancellation (`BaseException`, not given to `too_large`) are raised as they are. `calls` records in order the range each successful call read and its result, and `results` is the joined result. `min_size` is at least 1. Text is split by line: pass `text.splitlines(keepends=True)` |
+| `await reduce_tree(notes, budget=, cost=, merge=, overhead=0, max_depth=8) -> Reduced(notes, levels)` | Merges adjacent notes level by level until they fit in the budget together; the returned notes are read by the caller with its own final prompt (the prompts of the intermediate merges and of the final reduce differ). The groups of each level are merged one at a time, in order (concurrency on a rate-limited account only gets rejected). No progress, a merge result over budget, or reaching `max_depth` all raise `DoesNotFit` |
+| `select(chunks, budget=, cost=, key=) -> Selected(chosen, duplicates, over_budget)` | Takes from retrieval results the caller has already ranked, in order, and de-duplicates by key; it stops at the first one that does not fit, and every non-duplicate after that goes into `over_budget` and duplicates go into `duplicates` (a short low-ranked chunk never displaces a high-ranked one; the three lists exactly partition the input) |
 
-单元、笔记、检索块都是泛型：调用方用自己的类型（页、`(范围, 文本)`、检索结果），给出 `cost`。
+Units, notes and retrieval chunks are all generic: the caller uses its own types (a page, `(range, text)`, a
+retrieval result) and supplies `cost`.
 
-## 8. `Transcript`：给没有存储的宿主
+## 8. `Transcript`: for hosts with no storage
 
 ```python
 store = PgStore(url)                                       # or InMemoryStore() (extra `pg` for PgStore)
@@ -399,95 +511,114 @@ seq = await t.append([assistant_message, fitted.state], expected_seq=seq)   # th
 await t.compact(summarize=fn)                              # acompact() + appends the new state; None when nothing is due
 ```
 
-- **异步**（C5 定）：store 和 `Transcript` 的方法都是 `async`。可能的调用方都是异步的（C6 的 FastAPI 壳、异步宿主、
-  lite-agent），和 lite-agent 的 `SessionStore` 一致。`project()` 本身仍是纯函数，只是要先读 store。
-- append-only：条目是 `Message` 或 `ContextState`，带每个 transcript 内从 1 起单调递增的 `seq`。**消息的 key 就是
-  它的 seq**（`"1"`、`"2"`…），由 `Transcript` 分配；带着 key 的消息被拒（`ValueError`），不悄悄覆盖。这样已存的
-  `ContextState` 里的切点永远指向同一条消息。
-- `append(items, expected_seq)`：`expected_seq` 不是当前尾部时抛 `SeqConflict`，什么都不写；一批条目全有或全无；
-  批里的 seq 必须接在尾部后面。并发时一个成功、其余被拒（PG 里靠对 transcript 行 `FOR UPDATE`）。
-- `project()` 是纯投影：所有消息按 seq 排好，加上最新一条 `ContextState`（没有时为 `None`），交给 `fit()`。同一份
-  条目得到同一份输出；`fitted.state` 变了由调用方 append 回去。
-- `compact()`：对同样的消息和最新状态跑 `acompact()`，把新状态 append 上去，返回它的 seq；写摘要期间有人 append
-  了就是 `SeqConflict`（重跑即可）。
-- store 存的是 JSON 记录：消息用 `lite_context.codec`（`message_to_dict` / `message_from_dict`，带版本号，保留每个
-  部件的每个字段），状态用 `ContextState.to_json`。写入时按读回时的标准检查：JSON 还原不出相等值的内容（tuple、
-  非字符串的 key、NaN、对象）、类型不对的字段（`pinned=1`、`tokens=True`、tool result 里套 tool result）、任何地方的
-  NUL 字符和孤立的 surrogate（PostgreSQL 存不了）都在写入时被拒——transcript 只能追加，写进去读不回来就永远坏了。
-  内存和 PG 两种 store 因此行为一样。
-- PostgreSQL（extra `pg`，psycopg 3.3.8，与 lite-agent 同一个版本）：数据库和 role `lite_context`，schema
-  `lite_context`；只接受 `lite_context` 或 `lite_context_<名字>` 这样的 schema。测试只用同一数据库里的 schema
-  `lite_context_test`，URL 来自 `LITECONTEXT_TEST_DATABASE_URL`，没设时测试失败而不是跳过。表 `transcripts`、
-  `entries`；`entries.data` 是 `json` 而不是 `jsonb`（jsonb 会重排对象的 key，adapter 原样还给厂商的块就变了字节，
-  prompt cache 的前缀会断）；`entries` 上有拒绝 UPDATE / DELETE / TRUNCATE 的 trigger（与 lite-agent 的 events 表
-  一样）。数据库的任何失败都以 `StoreError` 出来（只带异常类型和 SQLSTATE）；第一次连接失败后下次调用重新连接。
-  迁移是包里的 `NNNN_*.sql`，`litecontext migrate` / `litecontext pending`（URL 来自 `LITECONTEXT_DATABASE_URL`）。
-  连接错误只显示异常类型和去掉密码的 URL。
+- **Async** (decided in C5): the methods of the store and of `Transcript` are all `async`. Every likely caller is
+  async (C6's FastAPI shell, async hosts, lite-agent), and this is consistent with lite-agent's `SessionStore`.
+  `project()` itself is still a pure function; it just has to read the store first.
+- Append-only: an entry is a `Message` or a `ContextState`, carrying a `seq` that increases monotonically from 1
+  within each transcript. **A message's key is its seq** (`"1"`, `"2"` …), assigned by `Transcript`; a message
+  that arrives with a key is rejected (`ValueError`), not quietly overwritten. This way the cut points in a
+  stored `ContextState` always point at the same message.
+- `append(items, expected_seq)`: when `expected_seq` is not the current tail it raises `SeqConflict` and writes
+  nothing; a batch of entries is all or nothing; the seqs in the batch must follow on from the tail. Under
+  concurrency one succeeds and the rest are rejected (in PG this relies on `FOR UPDATE` on the transcript row).
+- `project()` is a pure projection: all messages sorted by seq, plus the latest `ContextState` (`None` when there
+  is none), handed to `fit()`. The same entries give the same output; when `fitted.state` has changed, the
+  caller appends it back.
+- `compact()`: runs `acompact()` over the same messages and latest state, appends the new state and returns its
+  seq; if someone appended while the summary was being written it is `SeqConflict` (just run it again).
+- The store keeps JSON records: messages use `lite_context.codec` (`message_to_dict` / `message_from_dict`,
+  versioned, keeping every field of every part) and state uses `ContextState.to_json`. Writing is checked by the
+  standard of reading back: content that JSON cannot restore to an equal value (tuples, non-string keys, NaN,
+  objects), fields of the wrong type (`pinned=1`, `tokens=True`, a tool result nested in a tool result), and a
+  NUL character or a lone surrogate anywhere (PostgreSQL cannot store them) are rejected at write time — a
+  transcript can only be appended to, so something that is written and cannot be read back is broken for good.
+  The in-memory store and the PG store therefore behave the same.
+- PostgreSQL (extra `pg`, psycopg 3.3.8, the same version as lite-agent): database and role `lite_context`,
+  schema `lite_context`; only a schema named `lite_context` or `lite_context_<name>` is accepted. Tests use only
+  the schema `lite_context_test` in the same database, with the URL from `LITECONTEXT_TEST_DATABASE_URL`, and
+  when it is not set the tests fail rather than skip. Tables `transcripts` and `entries`; `entries.data` is
+  `json` and not `jsonb` (jsonb reorders the keys of an object, so a vendor block the adapter gives back as it
+  was would change its bytes and the prompt cache prefix would break); `entries` has triggers that reject UPDATE
+  / DELETE / TRUNCATE (the same as lite-agent's events table). Any database failure comes out as `StoreError`
+  (carrying only the exception type and the SQLSTATE); after a first connection failure the next call connects
+  again. Migrations are the package's `NNNN_*.sql`, run by `litecontext migrate` / `litecontext pending` (URL
+  from `LITECONTEXT_DATABASE_URL`). A connection error shows only the exception type and the URL with the
+  password removed.
 
-## 9. REST 壳
+## 9. REST shell
 
-`litecontext serve`（extra `server`，FastAPI 0.162.2 + uvicorn 0.54.0，与 lite-agent 同版本），只绑回环地址
-（默认 127.0.0.1:8750；`0.0.0.0`、局域网地址、连 `localhost` 这个名字都拒绝），不做鉴权，与 lite-agent 的 HTTP 壳一样，
-等有宿主要从别的机器访问时再定。Host 不是回环名字 400、带外来 Origin 403、POST 不是 JSON 415（这三条和 `check_host`
-从 lite-agent 抄来）；请求体超过 `LITECONTEXT_MAX_BODY`（默认 32 MiB）413——声明的长度超了直接拒，没声明的边读边数。
-壳里没有逻辑：`schemas` 解析（未知字段 422）、`wire` 转换、`app` 调一次库再序列化，同样的输入得到库给的结果。
+`litecontext serve` (extra `server`, FastAPI 0.162.2 + uvicorn 0.54.0, the same versions as lite-agent) binds
+only to the loopback address (default 127.0.0.1:8750; `0.0.0.0`, a LAN address, and even the name `localhost` are
+all refused) and does no authentication, like lite-agent's HTTP shell; that is decided when a host needs to
+reach it from another machine. A Host that is not a loopback name gets 400, a foreign Origin gets 403, a POST
+that is not JSON gets 415 (these three, and `check_host`, are copied from lite-agent); a request body over
+`LITECONTEXT_MAX_BODY` (default 32 MiB) gets 413 — a declared length that is over is refused at once, and an
+undeclared one is counted as it is read. The shell has no logic: `schemas` parses (an unknown field gives 422),
+`wire` converts, `app` calls the library once and serialises, so the same input gets the result the library
+gives.
 
-| 端点 | 状态 | 对应 / 返回 |
+| Endpoint | State | Maps to / returns |
 | --- | --- | --- |
-| `POST /v1/fit` | 无状态 | `fit()` → `{messages, state, report}` |
-| `POST /v1/compaction/plan` | 无状态 | `plan_compaction` → `{system, prompt, covered, mark, keep_last_turns}` 或 `null` |
-| `POST /v1/compaction/accept` | 无状态 | 把 plan 原样交回并加上 `reply`（`truncated`、`provenance`、`now` 可选）→ `{state}` |
-| `POST /v1/docs/split` | 无状态 | `split` → `{pieces: [{start, end, text, heading}]}`；`heading` 是正则（≤200 字符，按行匹配） |
-| `POST /v1/docs/pack`、`/v1/docs/select` | 无状态 | 单元 `{text?, tokens?, key?}`，返回下标：`{groups}` / `{chosen, duplicates, over_budget}` |
-| `POST /v1/transcripts` | 有状态 | `{id}` → `{id, last_seq}`（再建一次无害） |
-| `POST /v1/transcripts/{id}/entries` | 有状态 | `{format, items: [{message} \| {state}], expected_seq}` → `{last_seq}` |
-| `GET /v1/transcripts/{id}/entries?after=&format=` | 有状态 | `{entries: [{seq, kind, item}]}`；OpenAI 格式下消息的 `item` 是一组 chat 消息 |
-| `POST /v1/transcripts/{id}/project` | 有状态 | `Transcript.project` → 与 `/v1/fit` 同形 |
-| `POST /v1/transcripts/{id}/compaction/plan` / `.../accept` | 有状态 | `Transcript.plan_compaction` → plan 加 `expected_seq`；accept 把状态追加在那个 seq 后 → `{last_seq}` |
+| `POST /v1/fit` | stateless | `fit()` → `{messages, state, report}` |
+| `POST /v1/compaction/plan` | stateless | `plan_compaction` → `{system, prompt, covered, mark, keep_last_turns}` or `null` |
+| `POST /v1/compaction/accept` | stateless | hand the plan back as it was and add `reply` (`truncated`, `provenance`, `now` optional) → `{state}` |
+| `POST /v1/docs/split` | stateless | `split` → `{pieces: [{start, end, text, heading}]}`; `heading` is a regular expression (≤200 characters, matched per line) |
+| `POST /v1/docs/pack`, `/v1/docs/select` | stateless | units `{text?, tokens?, key?}`, returns indexes: `{groups}` / `{chosen, duplicates, over_budget}` |
+| `POST /v1/transcripts` | stateful | `{id}` → `{id, last_seq}` (creating again is harmless) |
+| `POST /v1/transcripts/{id}/entries` | stateful | `{format, items: [{message} \| {state}], expected_seq}` → `{last_seq}` |
+| `GET /v1/transcripts/{id}/entries?after=&format=` | stateful | `{entries: [{seq, kind, item}]}`; in OpenAI format a message's `item` is a list of chat messages |
+| `POST /v1/transcripts/{id}/project` | stateful | `Transcript.project` → the same shape as `/v1/fit` |
+| `POST /v1/transcripts/{id}/compaction/plan` / `.../accept` | stateful | `Transcript.plan_compaction` → the plan plus `expected_seq`; accept appends the state after that seq → `{last_seq}` |
 
-- 消息带 `format: anthropic | openai | neutral`，返回同一种格式；neutral 是 `codec` 的记录。OpenAI 开头的
-  system / developer 消息算作 fixed，原样放回最前面；它不能存进 transcript（422，要作为 fixed 文本传）。
-  摘要需要每条消息都有 key：Anthropic / OpenAI 格式用可选的 `keys`。
-- 步骤：`[{"step": "truncate_tool_results", "max_tokens": N} | {"step": "mask_tool_results", "keep_last": N} |
-  {"step": "mask_opaque", "keep_last": N} | {"step": "drop_oldest", "keep_last_turns": N}]`。计数器固定是
-  `CharEstimate`。
-- 错误：`{error, detail}`，`error` 是异常名的 snake case。`DoesNotFit` 422 并带 `report`；`UnsupportedInput`、
-  `BrokenPairing`、摘要为空或被截断、库拒绝的输入 422；`StaleState`、`SeqConflict` 409（后者带 `expected`、
-  `actual`）；`UnknownTranscript` 404；`StoreError` 503；没有数据库时 transcript 端点 503。
-- transcript 用 `PgStore`（`LITECONTEXT_DATABASE_URL`，启动后第一次用时连接，关闭时断开）；测试可以注入
-  `InMemoryStore`。`halving` / `reduce_tree` 需要回调，不在 REST 里。服务端自己调 role 写摘要（需要 lite-model 和
-  凭证）是以后的选项（§15）。
+- Messages carry `format: anthropic | openai | neutral` and the same format comes back; neutral is the `codec`
+  record. A leading system / developer message in OpenAI format counts as fixed and is put back at the very
+  front as it was; it cannot be stored in a transcript (422, pass it as fixed text). A summary needs every
+  message to have a key: for the Anthropic / OpenAI formats use the optional `keys`.
+- Steps: `[{"step": "truncate_tool_results", "max_tokens": N} | {"step": "mask_tool_results", "keep_last": N} |
+  {"step": "mask_opaque", "keep_last": N} | {"step": "drop_oldest", "keep_last_turns": N}]`. The counter is fixed
+  as `CharEstimate`.
+- Errors: `{error, detail}`, where `error` is the exception name in snake case. `DoesNotFit` is 422 and carries
+  `report`; `UnsupportedInput`, `BrokenPairing`, an empty or truncated summary, and input the library rejects are
+  422; `StaleState` and `SeqConflict` are 409 (the latter carries `expected` and `actual`); `UnknownTranscript`
+  is 404; `StoreError` is 503; the transcript endpoints are 503 when there is no database.
+- Transcripts use `PgStore` (`LITECONTEXT_DATABASE_URL`, connected on first use after start-up and disconnected
+  on shutdown); tests can inject `InMemoryStore`. `halving` / `reduce_tree` need callbacks and are not in REST.
+  The server calling a role itself to write the summary (which needs lite-model and credentials) is a later
+  option (§15).
 
-## 10. 配置
+## 10. Configuration
 
-库的参数都在代码里传。REST 壳的配置来自环境变量，前缀 `LITECONTEXT_`（`DATABASE_URL`、`HOST`、`PORT`、
-`MAX_BODY`）；
-`.env.example` 是模板，`.env` 不进 git。
+A library's parameters are all passed in code. The REST shell's configuration comes from environment variables
+with the prefix `LITECONTEXT_` (`DATABASE_URL`, `HOST`, `PORT`, `MAX_BODY`);
+`.env.example` is the template, and `.env` does not go into git.
 
-## 11. 测试
+## 11. Tests
 
-- pytest，`tests/conftest.py` 拒绝一切 socket（PostgreSQL 测试除外，只连 `LITECONTEXT_TEST_DATABASE_URL`）。
-- §5.2 的每条规则至少一个有名字的测试；adapter 有往返性质测试（hypothesis）。
-- 断言具体内容：输出的每条消息、报告里的每个动作和数字，不只是"没报错"。
-- CI：ruff、ruff format、mypy strict、pytest，在 Python 3.11 和 3.12 上各跑一遍。
-- 效果测量（C4 起）：宿主接入前后，记录同一批真实调用的输入 token、超窗口失败次数、prompt cache 命中；
-  masking 和摘要的质量对比用 lite-eval 跑（§15）。
+- pytest; `tests/conftest.py` refuses every socket (except the PostgreSQL tests, which connect only to
+  `LITECONTEXT_TEST_DATABASE_URL`).
+- Every rule of §5.2 has at least one named test; adapters have a round-trip property test (hypothesis).
+- Assert concrete content: every message in the output, every action and number in the report, not only "no
+  error".
+- CI: ruff, ruff format, mypy strict, pytest, each run on Python 3.11 and 3.12.
+- Measuring the effect (from C4): before and after a host is adopted, record on the same batch of real calls the
+  input tokens, the number of window-overflow failures and the prompt cache hits; the quality comparison of
+  masking and summaries is run with lite-eval (§15).
 
-## 12. 与其它项目的关系
+## 12. Relation to other projects
 
-| 项目 | 关系 |
+| Project | Relation |
 | --- | --- |
-| 宿主 A（Python 3.12，uv，自有 LLM 层和类型，Temporal 里的 tool loop） | C4：tool loop 每一步先 `fit()`（`TruncateToolResults` + `MaskToolResults`），代替现在只在产生时截断；纯函数，留在 workflow 里；摘要走一个新的 activity。文档的按页分组和对半重试换成 §7 |
-| 宿主 B（Python 3.11，pip，Anthropic 格式的 dict，chat 历史在 PostgreSQL 里由 TypeScript 服务持有） | C4 暂缓（owner 2026-11-26）：试过 chat 请求进 Python 时先 `fit()`（`MaskOpaque` + `DropOldest`，无状态），已撤回；文档工具不换（§15） |
-| lite-agent | C7：依赖 lite-context，把事件映射成中立 `Message`，它的 `SummaryCompactor` 和投影里的遮盖规则改用 lite-context。需要改它的设计（规则 8：lite-model 是唯一的 lite 依赖） |
-| lite-model | 不依赖。`lite_model` adapter 是 extra，版本跟 workspace pin |
-| lite-rag、lite-mem | 不依赖。lite-rag 负责检索和排序，§7 的 `select` 只在它排好的结果里挑 |
-| lite-eval | C4 之后用它对比 masking 和摘要的质量（extra `eval`） |
+| Host A (Python 3.12, uv, its own LLM layer and types, a tool loop inside Temporal) | C4: each step of the tool loop calls `fit()` first (`TruncateToolResults` + `MaskToolResults`), replacing today's truncation only when a result is produced; a pure function, it stays in the workflow; the summary goes through a new activity. Page grouping and halving retry for documents are replaced by §7 |
+| Host B (Python 3.11, pip, Anthropic-format dicts, chat history in PostgreSQL held by a TypeScript service) | C4 deferred (owner 2026-11-26): a trial called `fit()` first when a chat request entered Python (`MaskOpaque` + `DropOldest`, stateless) and was reverted; the document tools are not switched (§15) |
+| lite-agent | C7: depends on lite-context, maps events to neutral `Message`s, and its `SummaryCompactor` and the masking rules in its projection switch to lite-context. Its design needs to change (rule 8: lite-model is the only lite dependency) |
+| lite-model | Not a dependency. The `lite_model` adapter is an extra, and the version follows the workspace pin |
+| lite-rag, lite-mem | Not a dependency. lite-rag handles retrieval and ranking, and §7's `select` only picks within the results it has ranked |
+| lite-eval | After C4, used to compare the quality of masking and summaries (extra `eval`) |
 
-安装方式：GitHub Release wheel（与 lite-model、lite-agent 一样）。uv 宿主在 `[tool.uv.sources]` 写 wheel URL；
-pip 宿主在 requirements 里写 `lite-context @ <wheel URL>`。
+Installation: GitHub Release wheel (the same as lite-model and lite-agent). A uv host writes the wheel URL in
+`[tool.uv.sources]`; a pip host writes `lite-context @ <wheel URL>` in its requirements.
 
-## 13. 项目结构
+## 13. Project structure
 
 ```
 lite-context/
@@ -503,355 +634,509 @@ lite-context/
   docs/lite-context-design.md
 ```
 
-## 14. 阶段与验收
+## 14. Stages and acceptance
 
-§5.2、§6 的每条规则都要对应到至少一个有名字的测试；阶段收尾时列出"规则 → 测试"的对照。
+Every rule of §5.2 and §6 must map to at least one named test; when a stage is closed out, the "rule → test"
+mapping is listed.
 
-每个阶段收尾都按 AGENTS.md Workflow 第 4 步执行：`/simplify`，然后 Codex 只读 review，然后修复（否决的
-写在本节的阶段记录里），最后重跑全部检查。
+Every stage closes out by step 4 of the AGENTS.md Workflow: `/simplify`, then a read-only Codex review, then
+fixes (rejected findings are written in this section's stage records), and finally re-run every check.
 
-| 阶段 | 内容 | 验收 |
+| Stage | Content | Acceptance |
 | --- | --- | --- |
-| S0 | 仓库、设计文档、AGENTS.md / CLAUDE.md / README、项目 KB、workspace `AGENTS.md` 登记、端口 8750 登记 | 本文经 owner 确认；Codex 对设计的 review 已处理 |
-| C0 | 骨架：pyproject（uv、uv_build、ruff、mypy strict、pytest、`requires-python >=3.11`）、CI（3.11 + 3.12）、拒绝 socket 的 conftest；§3 的类型和 `anthropic` / `openai` adapter；§4 的计数器和预算；`Report`、`DoesNotFit` | 两个版本上 ruff、mypy、pytest 全绿；adapter 往返性质测试加 §3.2 列出的每个具名用例；表外输入抛 `UnsupportedInput`；`Opaque` 的估算按种类且不对 `raw` 计数；核心 import 时没有第三方模块（测试按 §2 的清单检查 `sys.modules`）；`fixed` 超预算直接 `DoesNotFit` |
-| C1（分两步：C1a = `fit()`、步骤、`ContextState` 与切点、运行时检查、`testing.check_step`；C1b = §6 的摘要） | `fit()` 与 §5.3 的四个步骤、高低水位、`ContextState` 与切点（§5.4）、§6 的 `plan_compaction` / `accept` / `acompact`、`SummaryPolicy` 与应用摘要 | §5.2 七条规则各有测试（含 `UnreportedChange` 抓住一个故意不报告的自写步骤）；同一输入两次 `fit()` 结果相同；带 `state` 连续调用 20 轮、历史每轮变长：被改动的旧消息只在越过高水位的那几轮变化，其余轮次与上一轮的输出前缀逐字节相同（cache 稳定性）；不完整配对的三种情况（最后批次未完成放行、缺结果和缺 call 抛 `BrokenPairing`）；`keep_last` 按批次计数；`DropOldest` 不拆开以 tool 结果开头的轮；超大的最新 tool 结果被常驻步骤截断而不是 `DoesNotFit`；thinking 块不被任何步骤改动；`StaleState` 的三种情况（找不到切点、数量或摘要值不符、切点不在轮边界）；摘要后原 messages 不变、输出以摘要开头；后一次压缩吃进前一次；截断或空摘要失败；切点不拆配对、不越过 pinned 消息、pinned 前缀留在摘要之前；找不到 `covers_through` 报错；`testing.py` 的 fixture 能套在一个宿主自写的步骤上 |
-| C2 | §7：`split`、`pack`、`halving`、`reduce_tree`、`select` | 用两个首批宿主现有实现的行为写测试（重叠比例、切在换行、单元超预算报错、对半到 `min_size` 后抛出、分层次数、去重）；`reduce_tree` 在 `merge` 不缩短输入、单条超预算、到 `max_depth` 时都抛出而不是死循环；调用方传入的 fake 记录每次调用的输入，断言分组和顺序 |
-| C3 | 发布 v0.1.0 release wheel | 一个新的 3.11 pip 环境和一个 3.12 uv 项目都能从 wheel 安装并跑通 README 的例子 |
-| C4 | 宿主 A、B 同时接入（各自仓库里做，各自收尾）；lite-context 这边只修接入中发现的问题 | 两个宿主的全部测试通过；接入前后同一批调用的输入 token、超窗口失败、cache 命中写进 KB；宿主 B 的 `ContextState` 持久化有迁移和测试；**通过条件**：用接入前录下的一批真实请求重放，超窗口失败为 0，输入 token 不高于接入前，两个宿主各自的测试全绿 |
-| C5 | §8：`Transcript`、`InMemoryStore`、`PgStore`（extra `pg`）、`litecontext migrate` | append-only（trigger 拒绝 UPDATE / DELETE）；并发 append 一个成功一个被拒；内存和 PG 的投影相同；跨进程读回后投影相同 |
-| C6 | §9 REST 壳（extra `server`） | 每个端点与库函数的输出逐字段相同（同一组 fixture 跑两遍）；只绑 127.0.0.1；请求体超限被拒 |
-| C7 | lite-agent 改用 lite-context（在 lite-agent 仓库里，先 plan mode）：它提供自己的 `SummaryPolicy`（轮的计法、渲染、头标处理） | lite-agent 的全部压缩测试不改一行仍然通过；做不到的地方先在 lite-context 补能力，或在 lite-agent 的阶段记录里逐条写明为什么改测试；它的设计 §6 和规则 8 同步更新 |
-| 按需 | token 级压缩步骤、服务端摘要、tiktoken 以外的计数器、async 计数器 | — |
+| S0 | Repo, design document, AGENTS.md / CLAUDE.md / README, project KB, registration in the workspace `AGENTS.md`, registration of port 8750 | This document confirmed by the owner; Codex's review of the design handled |
+| C0 | Skeleton: pyproject (uv, uv_build, ruff, mypy strict, pytest, `requires-python >=3.11`), CI (3.11 + 3.12), a conftest that refuses sockets; §3's types and the `anthropic` / `openai` adapters; §4's counter and budget; `Report`, `DoesNotFit` | ruff, mypy and pytest all green on both versions; the adapter round-trip property test plus every named case listed in §3.2; input outside the table raises `UnsupportedInput`; an `Opaque` estimate goes by kind and never counts `raw`; the core has no third-party module at import time (the test checks `sys.modules` against §2's list); `fixed` over budget goes straight to `DoesNotFit` |
+| C1 (two steps: C1a = `fit()`, steps, `ContextState` and cut points, runtime checks, `testing.check_step`; C1b = §6's summaries) | `fit()` and §5.3's four steps, high and low water marks, `ContextState` and cut points (§5.4), §6's `plan_compaction` / `accept` / `acompact`, `SummaryPolicy` and applying the summary | Each of the seven rules of §5.2 has a test (including `UnreportedChange` catching a hand-written step that deliberately does not report); two `fit()` calls on the same input give the same result; 20 consecutive calls with `state` while the history grows each turn: old messages change only in the turns that cross the high-water mark, and in the other turns the output has the previous turn's output as a byte-for-byte prefix (cache stability); the three incomplete-pairing cases (an unfinished last batch passes, a missing result and a missing call raise `BrokenPairing`); `keep_last` counts by batch; `DropOldest` does not split a turn that starts with a tool result; an oversized newest tool result is truncated by a standing step and not `DoesNotFit`; no step changes a thinking block; the three `StaleState` cases (cut point not found, count or digest mismatch, cut point not on a turn boundary); after a summary the original messages are unchanged and the output starts with the summary; a later compaction takes in the previous one; a truncated or empty summary fails; a cut point does not split a pairing, does not cross a pinned message, and the pinned prefix stays before the summary; a `covers_through` that cannot be found is an error; the `testing.py` fixture can be applied to a host's own step |
+| C2 | §7: `split`, `pack`, `halving`, `reduce_tree`, `select` | Tests written from the behaviour of the two first hosts' existing implementations (overlap ratio, cutting at newlines, an error when a unit is over budget, raising after halving down to `min_size`, number of levels, de-duplication); `reduce_tree` raises, rather than looping forever, when `merge` does not shorten the input, when a single note is over budget, and at `max_depth`; the caller's fake records the input of each call, and the tests assert grouping and order |
+| C3 | Release the v0.1.0 release wheel | A fresh 3.11 pip environment and a 3.12 uv project can both install from the wheel and run the README example |
+| C4 | Hosts A and B adopted together (done in each one's own repo, each closes out on its own); on the lite-context side, only fix the problems found during adoption | All tests of both hosts pass; the input tokens, window-overflow failures and cache hits of the same batch of calls before and after adoption are written into the KB; host B's `ContextState` persistence has a migration and tests; **pass condition**: replaying a batch of real requests recorded before adoption gives 0 window-overflow failures, input tokens no higher than before adoption, and each host's own tests all green |
+| C5 | §8: `Transcript`, `InMemoryStore`, `PgStore` (extra `pg`), `litecontext migrate` | Append-only (a trigger rejects UPDATE / DELETE); with concurrent appends one succeeds and one is rejected; the projections of the in-memory and PG stores are the same; the projection is the same after reading back across processes |
+| C6 | §9 REST shell (extra `server`) | Every endpoint's output matches the library function's field by field (the same set of fixtures run twice); binds only 127.0.0.1; an over-limit request body is rejected |
+| C7 | lite-agent switches to lite-context (in the lite-agent repo, plan mode first): it provides its own `SummaryPolicy` (how turns are counted, rendering, header handling) | All of lite-agent's compaction tests still pass without changing a line; where that cannot be done, first add the capability in lite-context, or write down in lite-agent's stage records, one by one, why a test was changed; its design §6 and rule 8 are updated together |
+| As needed | Token-level compression step, server-side summaries, counters other than tiktoken, an async counter | — |
 
-### 阶段记录
+### Stage records
 
-（每个阶段收尾时追加：做了什么、规则 → 测试对照、Codex 的发现与处理。）
+(Appended at the close of each stage: what was done, the rule → test mapping, Codex's findings and how they were
+handled.)
 
-- **S0（2026-11-26）**：仓库、本文初稿、AGENTS.md / CLAUDE.md / README、项目 KB、workspace 登记、端口 8750。
-  Codex 不可用（账户额度用完，到 2026-12-18 才恢复），改由一个不带本文作者结论的 Claude 子代理做对抗式设计 review，
-  12 条发现全部成立、全部采纳：
-  1. 纯函数 `fit()` 加高低水位不能让 cache 稳定 → 加 `ContextState` 和切点（§5.4）。
-  2. "轮"按 user 消息切会拆开以 tool 结果开头的批次 → 重新定义轮（§3.1）。
-  3. "最后一条 user 消息不动"与常驻截断冲突 → 改为只保护最后一轮的人话（§5.2-4）。
-  4. 中立类型装不下厂商格式的全部字段 → `raw_args`、结果内容可含图片、`extra`、写明往返范围和具名用例（§3）。
-  5. mask thinking 块会被 Anthropic 拒绝 → thinking 不被任何步骤改动（§3.1、§5.2-7）。
-  6. `Opaque` 的估算 → 按种类估、不对 `raw` 计数、报告标明（§3.1）。
-  7. key 不可比较、历史被改后摘要过期、pinned 在覆盖范围里 → `covered_count` + 摘要值 + `StaleState`、覆盖范围不含 pinned（§6）。
-  8. 不完整配对没定义 → §3.1 写明，`BrokenPairing`；`keep_last` 按批次。
-  9. 自写步骤能悄悄丢内容 → 运行时 `UnreportedChange` 检查（§5.2-5）。
-  10. `reduce_tree` 可能不收敛 → 终止条件（§7）。
-  11. C7 与 lite-agent 的摘要规则不一致、C4 没有通过条件 → `SummaryPolicy` 可替换、C4 写明通过条件（§6.1、§14）。
-  12. 零碎矛盾（`expected_seq`、REST 缺压缩端点、测试 schema、核心模块清单、`compaction_due` 的计算时机）→ 逐条改正。
-- **C0（2026-11-26）**：`pyproject`（uv_build，与其它 lite 模块一致，原文写的 hatchling 改掉；`requires-python
-  >=3.11,<3.13`，ruff `target-version = py311`，mypy `python_version = 3.11`）、CI（3.11 + 3.12 矩阵）、
-  `types` / `count` / `report` / `errors`、`adapters/anthropic`、`adapters/openai`。与本文的偏差：`Opaque` 的估算放在
-  计数器里而不是 adapter（§3.1、§4 已改；收尾时又改回由 adapter 取度量，见下面的 /simplify）；`TiktokenCounter`
-  推迟到 C4（§4）。
-  规则 → 测试：
-  - 往返无损：`test_adapter_anthropic.py::test_every_supported_conversation_round_trips`、
-    `test_adapter_openai.py::test_every_supported_conversation_round_trips`（hypothesis），加 §3.2 每个具名用例
-    （字符串与单个 text 块、`cache_control`、tool_result 的三种 content 和 `is_error`、格式错误的 `arguments`、
-    `content: null` / `""` / 没有键、并行批次的多条 tool 消息、`name` 和未知键、system / developer 的位置）。
-  - 表外输入被拒：两个 adapter 的 `test_input_outside_the_supported_range_is_refused`。
-  - `Opaque` 原样回来：`test_blocks_the_core_does_not_handle_become_opaque_and_come_back_unchanged`（同一个对象）。
-  - 按种类估、不对 `raw` 计数：`test_count.py` 的 image / thinking / 文本文档 / PDF / 未知块五条。
-  - 核心零依赖：`test_core_imports.py`（子进程里按 §2 清单 import，检查 `sys.modules`）。
-  - `fixed` 超预算：`test_fixed_content_over_the_budget_does_not_fit_before_any_cutting`。
-  - 测试不联网：`test_no_network.py`。
-  见红：新测试先在空包上全部失败；之后逐个破坏被测代码确认关键测试变红（核心多 import 一个第三方模块、关掉拒绝
-  socket 的 fixture、Anthropic 不记录列表形式、PDF 页数恒为 0、OpenAI 提前解析 `arguments`），再恢复。
-  `/simplify`（四个角度的子代理）：采纳——计数器不再读厂商的块结构，adapter 在转换时取出 `Opaque.text` /
-  `Opaque.pages`（PDF 只解码一次）；content 形式从 `extra` 里带前缀的约定键改成有类型的 `content_form`，
-  `is_error` 改成 `bool | None`，`tool_calls: []` 和 `function` 的多余字段原样留在 `extra`，去掉命名空间键；两个
-  adapter 的重复（纯文本判断、text 块、opaque、字符串或列表）收进 `adapters/_common.py`；加 `fixed_texts()`；
-  `Opaque.estimated` 删掉（`tokens is None` 即估算）；OpenAI 输出混合内容时保持顺序；`Report` 里 C1 才用的字段
-  和 `Action` 删掉，C1 再加。跳过——计数结果缓存（C1 的 `fit()` 要按条累加而不是每删一条重数一遍，记在这里给 C1）；
-  `tool_use` 的 input 每次 json 往返（有大 input 的宿主时再说）。新加的测试（度量、顺序、`tool_calls: []`、
-  `fixed_texts`、`tokens` 不问计数器）都用破坏被测代码的方式见过红。
-  代码 review：Codex 不可用，由一个子代理对抗式 review 代替。6 条发现全部成立、全部修复，回归测试先红后绿：
-  1. Anthropic `tool_use.input` 有非字符串键、tuple、NaN 时被接受却回不来 → `allow_nan=False` 并核对 `loads(dumps(x)) == x`，
-     不等就 `UnsupportedInput`（`test_tool_use_input_that_would_not_come_back_equal_is_refused`）。
-  2. OpenAI 没有 `type` 的 tool call 输出时被补上 `type` → 只接受 `type: "function"`
-     （`test_a_tool_call_that_is_not_a_function_call_is_refused`）。
-  3. 输出和输入共享嵌套对象 → 写进 §3.1 的约定（有意不深拷贝）。
-  4. SDK 的 `tool_calls: null` 被拒 → 接受并原样保留（`test_the_sdk_shape_with_tool_calls_none_survives`）。
-  5. 性质测试的生成器漏了几个具名情况 → 补上（浮点数、message 和 tool_use 上的额外字段、document / redacted /
-     未知块、`tool_calls` 的四种形式、`function` 的多余字段、`name`、tool 内容里的图片和文件、`refusal`）；
-     额外用 3000 个例子各跑了一遍，没有失败。
-  6. `CharEstimate`、`Budget` 接受不可能的数 → 构造时和 `available()` 里校验（两条参数化测试）。
-  只记录不改：`restore` 在手工构造的 `extra` 与核心字段同名时让核心字段赢（adapter 自己产生的 `extra` 不会同名）；
-  `Message` 因为 `extra` 是 dict 而不能 hash（C1 若需要再说）；PDF 页数估计的局限（§4）。
+- **S0 (2026-11-26)**: repo, first draft of this document, AGENTS.md / CLAUDE.md / README, project KB, workspace
+  registration, port 8750. Codex was unavailable (account quota used up, back only on 2026-12-18), so a Claude
+  subagent that did not have the conclusions of this document's author did an adversarial design review; all 12
+  findings held and all were accepted:
+  1. A pure-function `fit()` with high and low water marks cannot keep the cache stable → add `ContextState` and
+     cut points (§5.4).
+  2. Cutting "turns" by user message would split a batch that starts with a tool result → redefine the turn
+     (§3.1).
+  3. "Do not touch the last user message" conflicts with standing truncation → protect only the human message of
+     the last turn (§5.2-4).
+  4. The neutral types cannot hold every field of the vendor formats → `raw_args`, result content that can hold
+     images, `extra`, and state the round-trip range and named cases (§3).
+  5. Masking a thinking block would be rejected by Anthropic → no step changes a thinking block (§3.1, §5.2-7).
+  6. Estimating `Opaque` → estimate by kind, never count `raw`, mark it in the report (§3.1).
+  7. Keys that are not comparable, a summary going stale after the history is changed, pinned inside the covered
+     range → `covered_count` + digest + `StaleState`, and a covered range with no pinned message (§6).
+  8. Incomplete pairing was not defined → written into §3.1, `BrokenPairing`; `keep_last` counts by batch.
+  9. A hand-written step could quietly lose content → runtime `UnreportedChange` check (§5.2-5).
+  10. `reduce_tree` might not converge → termination conditions (§7).
+  11. C7 inconsistent with lite-agent's summary rules, C4 had no pass condition → a replaceable `SummaryPolicy`,
+      and C4 states its pass condition (§6.1, §14).
+  12. Small contradictions (`expected_seq`, the REST shell lacking compaction endpoints, the test schema, the
+      core module list, when `compaction_due` is computed) → corrected one by one.
+- **C0 (2026-11-26)**: `pyproject` (uv_build, consistent with the other lite modules; the hatchling in the
+  original text was changed; `requires-python >=3.11,<3.13`, ruff `target-version = py311`, mypy
+  `python_version = 3.11`), CI (3.11 + 3.12 matrix), `types` / `count` / `report` / `errors`,
+  `adapters/anthropic`, `adapters/openai`. Deviations from this document: the `Opaque` estimate lives in the
+  counter rather than the adapter (§3.1 and §4 changed; at the close-out it was changed back to the adapter
+  taking the measures, see /simplify below); `TiktokenCounter` postponed to C4 (§4).
+  Rule → test:
+  - Lossless round trip: `test_adapter_anthropic.py::test_every_supported_conversation_round_trips`,
+    `test_adapter_openai.py::test_every_supported_conversation_round_trips` (hypothesis), plus every named case
+    of §3.2 (string and a single text block, `cache_control`, the three kinds of tool_result content and
+    `is_error`, a malformed `arguments`, `content: null` / `""` / no key, several tool messages of a parallel
+    batch, `name` and unknown keys, the position of system / developer).
+  - Input outside the table is refused: both adapters' `test_input_outside_the_supported_range_is_refused`.
+  - `Opaque` comes back unchanged:
+    `test_blocks_the_core_does_not_handle_become_opaque_and_come_back_unchanged` (the same object).
+  - Estimate by kind, never count `raw`: the five tests in `test_count.py` for image / thinking / text document
+    / PDF / unknown block.
+  - Zero-dependency core: `test_core_imports.py` (imports per §2's list in a subprocess and checks
+    `sys.modules`).
+  - `fixed` over budget: `test_fixed_content_over_the_budget_does_not_fit_before_any_cutting`.
+  - Tests do not touch the network: `test_no_network.py`.
+  Seen red: the new tests all failed first on an empty package; then the code under test was broken one at a
+  time to confirm the key tests turn red (the core importing one more third-party module, turning off the
+  socket-refusing fixture, Anthropic not recording the list form, the PDF page count always 0, OpenAI parsing
+  `arguments` early), and restored.
+  `/simplify` (subagents from four angles): accepted — the counter no longer reads the vendors' block structure,
+  and the adapters take out `Opaque.text` / `Opaque.pages` during conversion (a PDF is decoded only once); the
+  content form changed from a prefixed conventional key in `extra` to a typed `content_form`, `is_error` became
+  `bool | None`, `tool_calls: []` and the extra fields of `function` stay in `extra` as they are, and the
+  namespace keys were removed; the duplication between the two adapters (plain-text check, text block, opaque,
+  string or list) moved into `adapters/_common.py`; added `fixed_texts()`; `Opaque.estimated` removed
+  (`tokens is None` means estimated); OpenAI output keeps the order when content is mixed; the fields in
+  `Report` that only C1 uses and `Action` were removed, to be added back in C1. Skipped — caching the counting
+  result (C1's `fit()` has to accumulate per message rather than recount everything after each deletion; noted
+  here for C1); a JSON round trip of the `tool_use` input every time (later, when a host has large inputs). The
+  new tests (measures, order, `tool_calls: []`, `fixed_texts`, `tokens` not asking the counter) were all seen red
+  by breaking the code under test.
+  Code review: Codex was unavailable, replaced by an adversarial subagent review. All 6 findings held and were
+  all fixed, with regression tests red then green:
+  1. An Anthropic `tool_use.input` with non-string keys, tuples or NaN was accepted but could not come back →
+     `allow_nan=False` and check `loads(dumps(x)) == x`, and if not equal `UnsupportedInput`
+     (`test_tool_use_input_that_would_not_come_back_equal_is_refused`).
+  2. An OpenAI tool call with no `type` had a `type` added on output → accept only `type: "function"`
+     (`test_a_tool_call_that_is_not_a_function_call_is_refused`).
+  3. Output and input share nested objects → written into §3.1 as a convention (deliberately not deep-copied).
+  4. The SDK's `tool_calls: null` was rejected → accepted and kept as it is
+     (`test_the_sdk_shape_with_tool_calls_none_survives`).
+  5. The property test's generator missed some named cases → added (floats, extra fields on a message and on a
+     tool_use, document / redacted / unknown blocks, the four forms of `tool_calls`, extra fields of `function`,
+     `name`, images and files in tool content, `refusal`); additionally run once with 3000 examples each, no
+     failures.
+  6. `CharEstimate` and `Budget` accepted impossible numbers → validated at construction and in `available()`
+     (two parametrised tests).
+  Recorded but not changed: `restore` lets the core field win when a hand-built `extra` has the same name as a
+  core field (an `extra` the adapters produce never does); `Message` cannot be hashed because `extra` is a dict
+  (to be revisited if C1 needs it); the limits of the PDF page-count estimate (§4).
 
-- **C1a（2026-11-26）**：`structure.py`（批次、轮、配对检查）、`steps.py`（`Entry` / `Unit` / `StepContext`、
-  `AlwaysStep` / `CuttingStep` 协议、四个步骤、固定占位文本）、`state.py`（`ContextState`、`Cut`、JSON 带版本）、
-  `fit.py`（流程、高低水位、重放与推进切点、每步之后的运行时检查）、`testing.py`（`check_step`）；新错误
-  `BrokenPairing`、`StaleState`、`UnreportedChange`、`ProtectedChange`；`Report` 加上动作和前后数字。与本文的
-  偏差：批次规则收紧（还有 call 没回答时，下一条必须是带结果的消息）；`DropOldest` 的占位放在第一条被删消息的位置；
-  所有步骤都不碰受保护消息。
-  规则 → 测试（`tests/test_fit.py`，除另注）：
-  - §5.2-1 纯函数、输入不变：`test_the_input_is_untouched_and_the_same_input_gives_the_same_output`。
-  - §5.2-2 批次不拆开：`test_mask_keeps_the_last_n_batches_counting_a_parallel_batch_once`、
-    `test_an_unfinished_batch_is_never_masked`；配对检查 `test_structure.py::test_broken_pairing_is_refused`（五种）；
-    步骤拆开配对被抓 `test_a_step_that_breaks_a_rule_is_caught_at_run_time[break-pair]`。
-  - §5.2-3 pinned：`test_a_pinned_batch_is_skipped_and_the_next_one_masked`、
-    `test_drop_oldest_never_drops_a_turn_holding_a_pinned_message`、`...caught_at_run_time[touch-pinned]`。
-  - §5.2-4 最后一轮人话受保护、最新 tool 结果可截：`test_mask_opaque_removes_old_images_but_not_the_last_human_turns_or_thinking`、
-    `test_the_newest_tool_result_is_truncated_rather_than_failing_every_call`。
-  - §5.2-5 报告与运行时检查：`test_cutting_steps_stop_at_the_low_water_mark`（动作逐条比对）、
-    `...caught_at_run_time[silent-edit]`、`test_testing.py::test_a_host_step_that_hides_a_change_fails`。
-  - §5.2-6 固定占位：截断、mask、opaque、drop 四条测试都逐字比对常量。
-  - §5.2-7 thinking：`test_a_step_that_removes_a_thinking_block_is_caught` 和 opaque 那条。
-  - §5.1 高低水位：`test_nothing_is_cut_below_the_high_water_mark`、`test_cutting_steps_stop_at_the_low_water_mark`、
-    `test_when_every_step_has_run_and_it_still_does_not_fit_it_raises_with_the_report`、
-    `test_compaction_is_due_when_the_cut_history_is_still_over_the_high_water_mark`。
-  - §5.4 状态：`test_with_state_old_messages_change_only_on_the_turns_that_cross_the_high_water_mark`（20 轮，cache
-    稳定性）、`test_state_is_replayed_even_when_the_history_would_fit_without_it`、
-    `test_state_from_a_history_that_changed_before_the_cut_is_stale`、`test_without_keys_no_cuts_are_kept`、
-    `test_state_survives_json_and_an_unknown_version_is_refused`。
-  - `check_step`：`test_testing.py`（四个内置步骤通过且确实改动过，隐瞒改动的宿主步骤失败）。
-  见红：测试先写，在没有实现时全部失败；之后对 14 处关键代码逐一破坏（高水位门槛、低水位、重放、保护检查、未报告
-  检查、thinking 检查、配对检查、摘要值、未完成批次、opaque 保护、drop 保护、keep_last、未回答的 call、二分查找），
-  每处都有测试变红，再恢复。
-  `/simplify`（两个子代理）：采纳——`fit()` 的削减循环原来对每加一个单位都重放并重数整段历史（1000 条消息首次
-  调用 356–526 ms），改成每条消息只数一次、之后只重数步骤报告过的消息，并用二分查找定单位数（同样的输入 6–21 ms，
-  动作数不变）；`MaskToolResults` 直接从批次的 call 消息里取工具名，不再每次重建批次；三个步骤共用 `_rewrite`；
-  重复 key 检查共用 `check_unique`；测试的 `COUNTER` 用 `lite_context.testing` 里的；去掉死分支和一个 type ignore；
-  thinking 检查只看被动过的消息。设计上定下：新压缩不带切点、切点量摘要之后的历史（§5.4）；应用摘要是走同一个
-  运行时检查的内部步骤（§6.2），C1b 照此实现。跳过——把 `Unit` 做成泛型载荷（工具名改从消息里取之后没有需要）。
-  代码 review（Codex 不可用，子代理代替）：9 条发现，8 条修复、1 条记录；回归测试先红后绿：
-  1. 一个削减步骤推进后，后面步骤的单位列表变短，"前 n 个单位 + 摘要值"对不上，正常增长也抛 `StaleState` →
-     切点改成"削到哪一条消息 + 输入到那里的 ref 摘要值"，按位置重放（§5.4）
-     （`test_two_cutting_steps_keep_working_as_the_history_grows`，要求出现"一个步骤越过另一个步骤的切点"）。
-  2. 保护离开一张旧图片后它插进单位列表中间，同样误报 → 同一个修复
-     （`test_protection_moving_off_an_old_image_does_not_make_the_state_stale`）。
-  3. 调用方的 key `#1` 和没有 key 的消息的位置 ref 撞上，计数算错，超预算却不报错 → 保留 `#`、`+` 前缀；检查时
-     也要求 ref 唯一（`test_keys_that_look_like_internal_refs_are_refused`、`...caught_at_run_time[duplicate]`）。
-  4. `DropOldest` 的占位比删掉的消息还长，本来装得下却 `DoesNotFit` → 不采用让总数变大的切点
-     （`test_a_cut_that_would_cost_more_than_it_saves_is_not_taken`）。
-  5. `check_step` 不考 state 和增长 → 加增长与无 key 的运行；`fit()` 自己按位置排单位，所以"新到旧列出单位"
-     不再是错误（`test_the_order_a_step_lists_its_units_in_does_not_matter`）；增长检查抓得住输出随历史漂移的步骤
-     （`test_a_step_whose_output_drifts_as_the_history_grows_fails`）。
-  6. 截断按段而不按整个结果 → 按整个结果（`test_truncation_limits_a_whole_result_not_each_text_part`）。
-  7. `head_tail` 在不可加的计数器下头尾重叠 → 尾部只从剩下的部分取
-     （`test_head_and_tail_never_overlap_even_with_a_counter_that_is_not_additive`）。
-  8. 只记录：`DropOldest` 的占位是一条带文字的 user 消息，会被当成一轮的开头；`fit()` 里只有 `DropOldest` 自己按轮
-     切、而且看的是它的输入，所以现在没有影响。
-  9. `from_json` 对畸形输入抛各种异常 → 统一 `ValueError`（`test_a_malformed_state_is_a_value_error`）。
-  另外：二分查找时试过的每个候选都要过运行时检查（否则一个被放弃的违规输出不会被发现）。
-  测试 1 的最终版本（预算 1200、15 轮）没有在旧代码上跑过；它的第一版（预算 600）和测试 2 在旧代码上是红的。
-  修复后的计时与修复前相同量级（1000 条消息、三个削减步骤首次 27 ms）。
-  第二轮 review（切点改动较大，按收尾规则再审一次；子代理写了随机增长探针：随机历史一条一条加长、随机步骤组合和
-  预算、每次传回 state）：6 条发现全部修复，回归测试先红后绿：
-  1. 切点记整条消息，但 `MaskOpaque` 一张图片一个单位，可能只削了一条消息里的一部分，下次重放把其余的也削了 →
-     `fit()` 只在消息边界上停（`test_a_host_steps_units_in_one_message_are_cut_together`，宿主自己的按图片步骤）。
-  2. `MaskOpaque` 的 `keep_last` 边界落在一条消息中间，同样的问题 → 单位改成一条消息
-     （`test_images_in_one_message_are_cut_together_so_replay_cuts_no_more`）。
-  3. 二分查找假设"削得越多越省"，mask 比占位还短的结果会变长，找不到其实存在的切法 → 改成上面的估算加验证
-     （`test_a_cut_is_found_even_when_masking_some_results_makes_them_longer`、
-     `test_when_no_cut_reaches_the_low_mark_the_cheapest_one_that_fits_is_taken`）。线性扫描时首次调用退回到
-     392–667 ms，改成估算加验证后 10–15 ms（1000 条消息）。
-  4. 同一个 `Text` 对象出现两次时截断结果重复 → 按位置找（`test_truncation_handles_the_same_text_object_twice`）。
-  5. 截断加标记后反而更长 → 不截（`test_truncation_never_makes_a_result_longer`）；原来两条截断测试的输入因此改长。
-  6. `check_step` 的样例里没有一条消息多张图片 → 加上，并且一条一条地加长、三个预算。
-  7. 只记录：离开保护的图片在下一次重放时被削（§5.4 接受）；`check_step` 和随机增长测试对这一条放行。
-  随机增长探针收进仓库：`tests/test_growth.py`（150 个种子，每次检查无异常、同输入同输出、切点没动时前缀不变）；
-  另外手动多跑了 1000 个种子，没有失败。
-  见红补充：消息边界、最省回退、单位排序、唯一 ref、不采用更贵的切点这几处都用破坏代码的方式确认有测试变红。
+- **C1a (2026-11-26)**: `structure.py` (batches, turns, pairing check), `steps.py` (`Entry` / `Unit` /
+  `StepContext`, the `AlwaysStep` / `CuttingStep` protocols, the four steps, fixed placeholder text), `state.py`
+  (`ContextState`, `Cut`, JSON with a version), `fit.py` (the flow, high and low water marks, replaying and
+  advancing cut points, the runtime check after each step), `testing.py` (`check_step`); new errors
+  `BrokenPairing`, `StaleState`, `UnreportedChange`, `ProtectedChange`; `Report` gains actions and before / after
+  numbers. Deviations from this document: the batch rule was tightened (while a call is unanswered, the next
+  message must be one carrying results); `DropOldest`'s placeholder goes at the position of the first deleted
+  message; no step touches a protected message.
+  Rule → test (`tests/test_fit.py` unless noted):
+  - §5.2-1 pure function, input unchanged:
+    `test_the_input_is_untouched_and_the_same_input_gives_the_same_output`.
+  - §5.2-2 batches are not split: `test_mask_keeps_the_last_n_batches_counting_a_parallel_batch_once`,
+    `test_an_unfinished_batch_is_never_masked`; pairing check `test_structure.py::test_broken_pairing_is_refused`
+    (five cases); a step that splits a pairing is caught
+    `test_a_step_that_breaks_a_rule_is_caught_at_run_time[break-pair]`.
+  - §5.2-3 pinned: `test_a_pinned_batch_is_skipped_and_the_next_one_masked`,
+    `test_drop_oldest_never_drops_a_turn_holding_a_pinned_message`, `...caught_at_run_time[touch-pinned]`.
+  - §5.2-4 the human message of the last turn is protected, the newest tool result can be truncated:
+    `test_mask_opaque_removes_old_images_but_not_the_last_human_turns_or_thinking`,
+    `test_the_newest_tool_result_is_truncated_rather_than_failing_every_call`.
+  - §5.2-5 report and runtime check: `test_cutting_steps_stop_at_the_low_water_mark` (actions compared one by
+    one), `...caught_at_run_time[silent-edit]`, `test_testing.py::test_a_host_step_that_hides_a_change_fails`.
+  - §5.2-6 fixed placeholder: the four tests for truncate, mask, opaque and drop all compare the constants byte
+    for byte.
+  - §5.2-7 thinking: `test_a_step_that_removes_a_thinking_block_is_caught` and the opaque one.
+  - §5.1 high and low water marks: `test_nothing_is_cut_below_the_high_water_mark`,
+    `test_cutting_steps_stop_at_the_low_water_mark`,
+    `test_when_every_step_has_run_and_it_still_does_not_fit_it_raises_with_the_report`,
+    `test_compaction_is_due_when_the_cut_history_is_still_over_the_high_water_mark`.
+  - §5.4 state: `test_with_state_old_messages_change_only_on_the_turns_that_cross_the_high_water_mark` (20
+    turns, cache stability), `test_state_is_replayed_even_when_the_history_would_fit_without_it`,
+    `test_state_from_a_history_that_changed_before_the_cut_is_stale`, `test_without_keys_no_cuts_are_kept`,
+    `test_state_survives_json_and_an_unknown_version_is_refused`.
+  - `check_step`: `test_testing.py` (the four built-in steps pass and really change something, a host step that
+    hides a change fails).
+  Seen red: the tests were written first and all failed with no implementation; then 14 pieces of key code were
+  broken one by one (the high-water threshold, the low-water mark, replay, the protection check, the unreported
+  check, the thinking check, the pairing check, the digest, the unfinished batch, opaque protection, drop
+  protection, keep_last, an unanswered call, the binary search), a test turned red at each, and the code was
+  restored.
+  `/simplify` (two subagents): accepted — `fit()`'s cutting loop used to replay and recount the whole history for
+  every unit added (356–526 ms on the first call with 1000 messages); it now counts each message once and
+  afterwards recounts only the messages a step reported, and uses a binary search to fix the number of units (6–21
+  ms for the same input, the number of actions unchanged); `MaskToolResults` takes the tool name directly from
+  the batch's call message instead of rebuilding batches every time; the three steps share `_rewrite`; the
+  duplicate-key check shares `check_unique`; the tests' `COUNTER` uses the one in `lite_context.testing`; dead
+  branches and one type ignore removed; the thinking check looks only at the messages that were touched.
+  Decided in the design: a new compaction carries no cut points, and cut points measure the history after the
+  summary (§5.4); applying the summary is an internal step that goes through the same runtime check (§6.2), and
+  C1b implements it that way. Skipped — making `Unit` a generic payload (no need once the tool name is taken from
+  the message).
+  Code review (Codex unavailable, subagent in its place): 9 findings, 8 fixed and 1 recorded; regression tests
+  red then green:
+  1. After one cutting step advanced, a later step's unit list got shorter, "first n units + digest" no longer
+     matched, and normal growth raised `StaleState` → the cut point became "which message it cut through + a
+     digest of the input refs up to there", replayed by position (§5.4)
+     (`test_two_cutting_steps_keep_working_as_the_history_grows`, which requires "one step crossing another
+     step's cut point" to occur).
+  2. When protection left an old image it was inserted into the middle of the unit list, with the same false
+     alarm → the same fix (`test_protection_moving_off_an_old_image_does_not_make_the_state_stale`).
+  3. A caller's key `#1` collided with the position ref of a message with no key, the count was wrong, and going
+     over budget raised no error → the `#` and `+` prefixes are reserved; the check also requires refs to be
+     unique (`test_keys_that_look_like_internal_refs_are_refused`, `...caught_at_run_time[duplicate]`).
+  4. `DropOldest`'s placeholder was longer than the messages it deleted, so something that fit raised
+     `DoesNotFit` → a cut point that makes the total larger is not adopted
+     (`test_a_cut_that_would_cost_more_than_it_saves_is_not_taken`).
+  5. `check_step` did not test state and growth → added a growth run and a run without keys; `fit()` sorts the
+     units by position itself, so "listing units from new to old" is no longer an error
+     (`test_the_order_a_step_lists_its_units_in_does_not_matter`); the growth check catches a step whose output
+     drifts as the history grows (`test_a_step_whose_output_drifts_as_the_history_grows_fails`).
+  6. Truncation went by piece rather than by whole result → by whole result
+     (`test_truncation_limits_a_whole_result_not_each_text_part`).
+  7. `head_tail` overlapped head and tail under a non-additive counter → the tail is taken only from what is left
+     (`test_head_and_tail_never_overlap_even_with_a_counter_that_is_not_additive`).
+  8. Recorded only: `DropOldest`'s placeholder is a user message with text, so it is taken as the start of a
+     turn; in `fit()` only `DropOldest` itself cuts by turn, and it looks at its own input, so it has no effect
+     for now.
+  9. `from_json` raised various exceptions on malformed input → unified as `ValueError`
+     (`test_a_malformed_state_is_a_value_error`).
+  Also: every candidate tried during the binary search must pass the runtime check (otherwise a rule-breaking
+  output that was given up would go unnoticed).
+  The final version of test 1 (budget 1200, 15 turns) was not run against the old code; its first version
+  (budget 600) and test 2 were red on the old code. Timing after the fix is the same order of magnitude as before
+  the fix (1000 messages, three cutting steps, first call 27 ms).
+  Second round of review (the cut-point change was large, so it was reviewed again under the close-out rule; the
+  subagent wrote a random-growth probe: a random history grown one message at a time, random step combinations
+  and budgets, passing state back each time): all 6 findings fixed, with regression tests red then green:
+  1. A cut point records a whole message, but `MaskOpaque` had one unit per image and might cut only part of one
+     message, and the next replay cut the rest too → `fit()` stops only at message boundaries
+     (`test_a_host_steps_units_in_one_message_are_cut_together`, a host's own per-image step).
+  2. `MaskOpaque`'s `keep_last` boundary fell in the middle of a message, the same problem → the unit became one
+     message (`test_images_in_one_message_are_cut_together_so_replay_cuts_no_more`).
+  3. The binary search assumed "the more cut, the more saved", and masking a result that is shorter than the
+     placeholder makes it longer, so it missed a cut that does exist → changed to the estimate plus verification
+     described above (`test_a_cut_is_found_even_when_masking_some_results_makes_them_longer`,
+     `test_when_no_cut_reaches_the_low_mark_the_cheapest_one_that_fits_is_taken`). With a linear scan the first
+     call fell back to 392–667 ms; with estimate plus verification it is 10–15 ms (1000 messages).
+  4. When the same `Text` object appeared twice the truncation result was duplicated → look up by position
+     (`test_truncation_handles_the_same_text_object_twice`).
+  5. Truncation with the marker added came out longer → do not truncate
+     (`test_truncation_never_makes_a_result_longer`); the inputs of the two original truncation tests were
+     therefore made longer.
+  6. `check_step`'s samples had no message with several images → added, grown one message at a time, three
+     budgets.
+  7. Recorded only: an image that leaves protection is cut at the next replay (accepted in §5.4); `check_step`
+     and the random-growth test let this one pass.
+  The random-growth probe went into the repo: `tests/test_growth.py` (150 seeds; each checks no exception, the
+  same input gives the same output, and the prefix is unchanged when the cut points did not move); another 1000
+  seeds were run by hand, no failures.
+  Seen-red addendum: message boundaries, the cheapest-cut fallback, unit ordering, unique refs and not adopting a
+  more expensive cut point were each confirmed by breaking the code and seeing a test turn red.
 
-- **C1b（2026-11-26）**：`compaction.py`（`SummaryPolicy`、`plan_compaction`、`CompactionPlan.accept`、`acompact`、
-  `Summary`、`covered_end`）；`Compaction` 放进 `state.py`，`ContextState.compaction` 随 JSON 存取；`fit()` 把应用摘要
-  作为内部步骤、走同一个运行时检查；新错误 `EmptySummary`、`TruncatedSummary`。与本文的偏差：`created_at` 是 ISO
-  字符串；`covered_count` 去掉（摘要值已经覆盖条数）；`plan.covered` 给出覆盖的 key。
-  规则 → 测试（`tests/test_compaction.py`，除另注）：
-  - 覆盖范围：`test_a_plan_covers_every_turn_but_the_kept_ones_and_renders_them`、
-    `test_a_pinned_prefix_stays_out_and_a_later_pinned_message_stops_the_cut`、`test_nothing_to_cover_gives_no_plan`、
-    `test_compaction_needs_keys`。
-  - 后一次吃进前一次：`test_a_later_compaction_takes_in_the_earlier_summary`、
-    `test_nothing_new_to_cover_after_a_compaction_gives_no_plan`。
-  - 截断、空摘要失败，抄进来的头标去掉：`test_an_empty_or_truncated_summary_is_refused`、
-    `test_header_lines_the_model_copied_are_removed`。
-  - 应用摘要、报告、输入不变：`test_fit_shows_the_summary_in_place_of_what_it_covers_and_reports_it`。
-  - 过期：`test_a_summary_that_no_longer_matches_the_history_is_stale`（删掉覆盖的最后一条、之前插入、改 key、
-    不在轮边界）、`test_a_summary_with_keyless_messages_is_stale`。
-  - 切点量摘要之后的历史、新摘要不带切点：`test_cuts_are_measured_after_the_summary_and_start_again_after_a_new_one`。
-  - JSON：`test_state_with_a_compaction_survives_json`；`acompact`：`test_acompact_plans_calls_the_callers_model_and_accepts`。
-  - 端到端：`tests/test_growth.py::test_a_growing_history_with_summaries_replays_stably`（60 个种子，需要时就写摘要，
-    共写了 60 次；无异常、切点和摘要都没动时前缀不变）。
-  见红：测试先写，没有实现时收集失败；之后破坏 10 处（摘要值、轮边界、截断、头标清理、停在 pinned、没有新内容、
-  吃进前一次、`state` 保留摘要、无 key 检查、条数检查）：前 9 处有测试变红；条数检查破坏后没有测试变红，因为摘要值
-  已经覆盖条数，于是删掉了条数这个字段；无 key 检查原来没有测试，补上并见红。
+- **C1b (2026-11-26)**: `compaction.py` (`SummaryPolicy`, `plan_compaction`, `CompactionPlan.accept`,
+  `acompact`, `Summary`, `covered_end`); `Compaction` moved into `state.py`, and `ContextState.compaction` is
+  stored and read back with the JSON; `fit()` takes applying the summary as an internal step that goes through
+  the same runtime check; new errors `EmptySummary`, `TruncatedSummary`. Deviations from this document:
+  `created_at` is an ISO string; `covered_count` removed (the digest already covers the count); `plan.covered`
+  gives the covered keys.
+  Rule → test (`tests/test_compaction.py` unless noted):
+  - Covered range: `test_a_plan_covers_every_turn_but_the_kept_ones_and_renders_them`,
+    `test_a_pinned_prefix_stays_out_and_a_later_pinned_message_stops_the_cut`,
+    `test_nothing_to_cover_gives_no_plan`, `test_compaction_needs_keys`.
+  - A later one takes in the earlier one: `test_a_later_compaction_takes_in_the_earlier_summary`,
+    `test_nothing_new_to_cover_after_a_compaction_gives_no_plan`.
+  - A truncated or empty summary fails, copied header lines are removed:
+    `test_an_empty_or_truncated_summary_is_refused`, `test_header_lines_the_model_copied_are_removed`.
+  - Applying the summary, the report, input unchanged:
+    `test_fit_shows_the_summary_in_place_of_what_it_covers_and_reports_it`.
+  - Stale: `test_a_summary_that_no_longer_matches_the_history_is_stale` (deleting the last covered message,
+    inserting before, changing a key, not on a turn boundary), `test_a_summary_with_keyless_messages_is_stale`.
+  - Cut points measure the history after the summary, a new summary carries no cut points:
+    `test_cuts_are_measured_after_the_summary_and_start_again_after_a_new_one`.
+  - JSON: `test_state_with_a_compaction_survives_json`; `acompact`:
+    `test_acompact_plans_calls_the_callers_model_and_accepts`.
+  - End to end: `tests/test_growth.py::test_a_growing_history_with_summaries_replays_stably` (60 seeds, a summary
+    written whenever needed, 60 summaries in all; no exception, and the prefix is unchanged when neither the cut
+    points nor the summary moved).
+  Seen red: the tests were written first and failed at collection with no implementation; then 10 places were
+  broken (the digest, the turn boundary, truncation, header cleanup, stopping at pinned, nothing new, taking in
+  the earlier one, `state` keeping the summary, the no-key check, the count check): for the first 9 a test turned
+  red; breaking the count check turned no test red, because the digest already covers the count, so the count
+  field was deleted; the no-key check originally had no test, one was added and seen red.
 
-  收尾：`/simplify`（一个子代理，四个角度）与代码 review（Codex 不可用，子代理代替）同时跑。
-  review 7 条：1、2、5 `end` 可能落到历史末尾（`keep_last_turns=0`、没有人话、负数），摘要盖住当前一轮或没完成的
-  批次，之后的状态用不了 → `end` 永远是某一轮的开头，`keep_last_turns >= 1`
-  （`test_keep_last_turns_must_keep_at_least_the_current_turn`、`test_a_history_without_human_turns_gives_no_plan`、
-  `test_fewer_turns_than_kept_gives_no_plan`、`test_the_plan_never_covers_an_unfinished_batch_or_the_last_turn`）；
-  3 `provenance` 不是 JSON 时存储时才失败、tuple 往返不等 → `accept` 里按 JSON 规整
-  （`test_provenance_is_stored_as_json_gives_it_back`）；4 头标清理只认十六进制 mark → plan 记下 mark、只清这个
-  （`test_copied_headers_are_removed_whatever_the_mark`）；7 前一次摘要带着前言交给模型 → 先去掉
-  （`test_the_earlier_summary_goes_back_to_the_model_without_its_preamble`）；6 摘要后面是连续的 user 消息 → 写进
-  §6.2。
-  `/simplify` 8 条：采纳——两个相同的摘要函数合成 `digest`；`pinned_prefix` 移到 `structure.py`；`next()` 代替只取第一项
-  的列表；`render` 按消息拆出 `_render`；`_summarised` 只收 `entries`，`SUMMARY_REF` 放到模块开头；`Compaction` 的 JSON
-  用 `asdict` / `fields`；`__all__` 只列本模块定义的。跳过——`human_turns` 算两次（O(n)，便宜）；把 `SummaryPolicy`
-  改成 Protocol（lite-agent 在 C7 可以继承或 `replace` 它，届时再定）。
-  见红：回归测试先红后绿；修复处逐一破坏（`keep_last_turns` 校验、轮数不足、JSON 规整、按 mark 清理、去前言），
-  每处都有测试变红；"轮数不足"一处起初没有测试变红，补了 `test_fewer_turns_than_kept_gives_no_plan`。
+  Close-out: `/simplify` (one subagent, four angles) and the code review (Codex unavailable, subagent in its
+  place) ran at the same time.
+  Review, 7 findings: 1, 2, 5 `end` could land at the end of the history (`keep_last_turns=0`, no human
+  messages, a negative value), the summary covered the current turn or an unfinished batch, and the resulting
+  state was unusable → `end` is always the start of some turn, and `keep_last_turns >= 1`
+  (`test_keep_last_turns_must_keep_at_least_the_current_turn`,
+  `test_a_history_without_human_turns_gives_no_plan`, `test_fewer_turns_than_kept_gives_no_plan`,
+  `test_the_plan_never_covers_an_unfinished_batch_or_the_last_turn`); 3 a `provenance` that is not JSON failed
+  only at storage time, and a tuple was not equal after a round trip → normalised as JSON in `accept`
+  (`test_provenance_is_stored_as_json_gives_it_back`); 4 header cleanup recognised only a hexadecimal mark → the
+  plan records the mark and cleans only that one (`test_copied_headers_are_removed_whatever_the_mark`); 7 the
+  previous summary was given to the model with its preamble → remove it first
+  (`test_the_earlier_summary_goes_back_to_the_model_without_its_preamble`); 6 consecutive user messages after the
+  summary → written into §6.2.
+  `/simplify`, 8 findings: accepted — the two identical digest functions merged into `digest`; `pinned_prefix`
+  moved to `structure.py`; `next()` instead of a list of which only the first item is taken; `render` split out
+  into `_render` per message; `_summarised` takes only `entries`, and `SUMMARY_REF` goes at the top of the
+  module; `Compaction`'s JSON uses `asdict` / `fields`; `__all__` lists only what the module defines. Skipped —
+  `human_turns` computed twice (O(n), cheap); making `SummaryPolicy` a Protocol (lite-agent can inherit from it
+  or `replace` it in C7, to be decided then).
+  Seen red: regression tests red then green; the fix sites were broken one by one (the `keep_last_turns`
+  validation, too few turns, JSON normalisation, cleanup by mark, removing the preamble), a test turned red at
+  each; for "too few turns" no test turned red at first, and `test_fewer_turns_than_kept_gives_no_plan` was
+  added.
 
-- **C2（2026-11-26）**：`docs.py`（`split`、`pack`、`halving`、`reduce_tree`、`select`，泛型）；`steps._longest`
-  移到 `count.longest_prefix`（`split` 也用），按文本自己的字符/token 比定窗口再二分，1 MB 文本切 8k 段约 20 ms。与本文
-  的偏差：一个模块而不是 `docs/` 包；`pack` 不切超大单元（单元的类型由调用方定，切不了），超了就 `DoesNotFit`；
-  `reduce_tree` 返回能一起放进预算的笔记，最终 reduce 由调用方做；`select` 遇到第一条放不下的就停。
-  规则 → 测试（`tests/test_docs.py`）：装得下原样一段 `test_text_that_fits_is_one_piece_exactly_as_given`；覆盖、
-  重叠、切在换行 `test_pieces_cover_the_text_overlap_and_end_at_a_line_break`；没有换行也切得开
-  `test_a_long_line_without_breaks_is_still_cut_to_size`；标题 `test_each_piece_carries_the_heading_above_where_it_starts`；
-  默认估算下不超限、1 MB 速度 `test_split_respects_the_limit_with_the_default_estimate_and_cuts_a_large_text_quickly`；
-  `pack` 两条；`halving` 三条（只拆太大的、别的失败一次调用后原样抛出、到最小仍抛出）；`reduce_tree` 五条（装得下不
-  合并、按层按序合并、单条合不了失败、到深度限制失败、合并结果超预算失败）；`select` 一条（排序、去重、遇超即停）。
-  见红：测试先写，没有实现时收集失败；之后破坏 13 处，起初 4 处没有测试变红：装得下的提前返回（与一般路径等价，
-  删掉）、切在换行（测试文本恰好整行落在 500，改了行长）、只拆太大的（不拆也会最终抛出同一个异常，测试改成断言只调
-  用一次）、深度限制（测试先撞上"没有进展"，加了一个每层都有进展的场景）；改完后都变红。
+- **C2 (2026-11-26)**: `docs.py` (`split`, `pack`, `halving`, `reduce_tree`, `select`, generic);
+  `steps._longest` moved to `count.longest_prefix` (`split` uses it too), which fixes the window from the text's
+  own character / token ratio and then binary-searches, about 20 ms to split 1 MB of text into 8k pieces.
+  Deviations from this document: one module rather than a `docs/` package; `pack` does not cut an oversized unit
+  (the unit's type is up to the caller and cannot be cut), and over the limit it is `DoesNotFit`; `reduce_tree`
+  returns the notes that fit in the budget together, and the final reduce is done by the caller; `select` stops
+  at the first one that does not fit.
+  Rule → test (`tests/test_docs.py`): fits means one piece as given
+  `test_text_that_fits_is_one_piece_exactly_as_given`; coverage, overlap, cutting at newlines
+  `test_pieces_cover_the_text_overlap_and_end_at_a_line_break`; it can still be cut with no newline
+  `test_a_long_line_without_breaks_is_still_cut_to_size`; heading
+  `test_each_piece_carries_the_heading_above_where_it_starts`; not over the limit under the default estimate, and
+  the speed on 1 MB `test_split_respects_the_limit_with_the_default_estimate_and_cuts_a_large_text_quickly`;
+  two for `pack`; three for `halving` (halve only what is too large, any other failure is raised as it is after
+  one call, still raised at the minimum); five for `reduce_tree` (no merge when it fits, merge by level and in
+  order, failure when a single note cannot be merged, failure at the depth limit, failure when a merge result is
+  over budget); one for `select` (order, de-duplication, stop at the first one over).
+  Seen red: the tests were written first and failed at collection with no implementation; then 13 places were
+  broken, and at first 4 had no test turn red: the early return when it fits (equivalent to the general path,
+  deleted), cutting at newlines (the test text happened to put whole lines at exactly 500, so the line length was
+  changed), halving only what is too large (not halving would also end up raising the same exception, so the
+  test was changed to assert only one call), the depth limit (the test hit "no progress" first, and a scenario
+  that makes progress at every level was added); after the changes all turned red.
 
-  收尾：`/simplify`（子代理，四个角度）与代码 review（Codex 不可用，子代理代替）同时跑，两边去重后：
-  1. `halving` 的 `min_size=0` 无限递归 → 至少为 1（`test_halving_needs_a_minimum_of_at_least_one`）。
-  2. 捕获 `BaseException` 把取消交给了调用方的判断函数 → 只捕获 `Exception`
-     （`test_a_cancellation_never_reaches_the_size_predicate`）。
-  3. `select` 停下之后会丢块、`over_budget` 里有重复 → 停下后照样去重，三个列表分完输入
-     （`test_select_sorts_every_chunk_into_exactly_one_list`）。
-  4. `split` 每段都把剩下的全文数一遍，真实分词器下是全文的 66 倍 → 按小段只数一次，约 3 倍
-     （`test_split_counts_a_bounded_window_not_the_whole_rest_each_time`）；不可加的计数器有测试
-     （`test_a_counter_that_charges_more_for_the_whole_than_its_parts_is_still_respected`）；计数器自相矛盾时报错而不死循环。
-  5. 开在标题行上的段带的是上一个标题 → 带它自己所在章节的（`test_a_piece_that_starts_on_a_heading_carries_that_heading`，
-     原来那条标题测试的期望随之改）。
-  6. `Halved` 说不出哪些结果来自哪一段 → 每次调用一条记录（`test_halving_says_which_results_each_call_gave`）。
-  7. 四处相同的 `DoesNotFit` 构造合成 `_too_big`；`reduce_tree` 每层每条只数一次；去掉死代码。`DoesNotFit` 带的
-     `Report` 在这里只有 limit 和 overhead 有意义——没改成可选（会改公开接口），记在这里。
-  见红：回归测试先红后绿；修复处逐一破坏，都有测试变红；"超长小段先截断"一处破坏后测试卡死，加了防护让它报错，
-  之后破坏是一条测试失败而不是卡住。
+  Close-out: `/simplify` (subagent, four angles) and the code review (Codex unavailable, subagent in its place)
+  ran at the same time, and after de-duplicating the two:
+  1. `halving` with `min_size=0` recursed forever → at least 1
+     (`test_halving_needs_a_minimum_of_at_least_one`).
+  2. Catching `BaseException` handed cancellation to the caller's predicate → catch only `Exception`
+     (`test_a_cancellation_never_reaches_the_size_predicate`).
+  3. After `select` stopped it would lose chunks and `over_budget` contained duplicates → keep de-duplicating
+     after it stops, and the three lists partition the input
+     (`test_select_sorts_every_chunk_into_exactly_one_list`).
+  4. `split` counted all the remaining text for every piece, 66 times the full text under a real tokenizer →
+     count each small segment once, about 3 times
+     (`test_split_counts_a_bounded_window_not_the_whole_rest_each_time`); there is a test for a non-additive
+     counter (`test_a_counter_that_charges_more_for_the_whole_than_its_parts_is_still_respected`); a
+     self-contradictory counter gives an error instead of an endless loop.
+  5. A piece that starts on a heading line carried the previous heading → it carries the heading of its own
+     section (`test_a_piece_that_starts_on_a_heading_carries_that_heading`; the expectation of the original
+     heading test changed with it).
+  6. `Halved` could not say which results came from which piece → one record per call
+     (`test_halving_says_which_results_each_call_gave`).
+  7. The four identical `DoesNotFit` constructions merged into `_too_big`; `reduce_tree` counts each note once
+     per level; dead code removed. In the `Report` that `DoesNotFit` carries, only limit and overhead are
+     meaningful here — not made optional (that would change the public interface), recorded here.
+  Seen red: regression tests red then green; the fix sites were broken one by one and a test turned red each
+  time; after breaking "cut an over-long small segment first" the test hung, a guard was added so that it
+  reports an error, and after that the break shows as a failing test rather than a hang.
 
-- **C3（2026-11-26，准备）**：版本 0.1.0；CI 加 `package`（`uv build`，在干净的 3.11 环境里只装这个 wheel，用
-  `python -I` 跑 `scripts/smoke.py`：README 的完整例子，adapter → `fit` → JSON 状态 → `acompact` → 再 `fit` → `split`，
-  断言具体结果）和 `release`（v* 标签时把 `package` 构建的那份发布到 GitHub Release）。本地验证：uv 建的 3.11 环境、
-  pip 建的 3.11 venv、一个 uv 3.12 新项目 `uv add <wheel>`，三处 smoke 都通过。README 改成真实用法和安装方式。
-  发现：步骤列表先赋给变量时 mypy 推成 `list[object]`，要标注 `list[Step]`（README 写明）。
-  发布（owner 同意）：`v0.1.0` 标签 → CI 四个 job 全绿（test 3.11、3.12，package，release）→ GitHub Release 带
-  `lite_context-0.1.0-py3-none-any.whl` 和 sdist。验收：从 release URL 用 pip（3.11 venv）和 `uv add`（3.12 新项目）
-  安装，smoke 都通过。
+- **C3 (2026-11-26, preparation)**: version 0.1.0; CI adds `package` (`uv build`, installs only this wheel in a
+  clean 3.11 environment, and runs `scripts/smoke.py` with `python -I`: the README's full example, adapter →
+  `fit` → JSON state → `acompact` → `fit` again → `split`, asserting concrete results) and `release` (on a v*
+  tag, publishes the one `package` built to a GitHub Release). Local verification: a 3.11 environment made by
+  uv, a 3.11 venv made by pip, and a new uv 3.12 project with `uv add <wheel>`, and the smoke run passed in all
+  three. The README was changed to the real usage and installation. Found: when the step list is first assigned
+  to a variable, mypy infers `list[object]`, and it must be annotated `list[Step]` (the README says so).
+  Release (owner agreed): `v0.1.0` tag → all four CI jobs green (test 3.11, 3.12, package, release) → a GitHub
+  Release with `lite_context-0.1.0-py3-none-any.whl` and the sdist. Acceptance: installed from the release URL
+  with pip (3.11 venv) and `uv add` (3.12 new project), and the smoke run passed in both.
 
-- **v0.1.1（2026-11-26，C4 准备时发现）**：wheel 里没有 `py.typed`，宿主的 pyright / mypy 会把 lite-context 当成
-  无类型的包。加上 `src/lite_context/py.typed`；CI 的 `package` job 检查 wheel 里有它（加之前在本地构建确认这条检查
-  失败）。
+- **v0.1.1 (2026-11-26, found while preparing C4)**: the wheel had no `py.typed`, so a host's pyright / mypy
+  treated lite-context as an untyped package. Added `src/lite_context/py.typed`; CI's `package` job checks that
+  the wheel contains it (before adding it, the check was confirmed to fail on a local build).
 
-- **v0.1.2（2026-11-26，宿主 A 接入的 review 发现）**：有些 OpenAI 兼容后端每次回复都把 call 编号成 `call_0`，
-  `MaskToolResults` 按 call id 在所有消息里找结果，于是旧批次被 mask 时，复用同一个 id 的最新结果也被 mask 了，模型
-  拿不到刚要的结果。改成每个批次只 mask 它自己那几条结果消息里的结果，工具名也取自它自己的 call 消息
-  （`test_a_call_id_reused_by_a_later_batch_does_not_mask_the_later_result`，改之前红）；随机增长测试也加了复用 id 的
-  历史（它检查前缀稳定，抓不到这个错误，单元测试负责）。
+- **v0.1.2 (2026-11-26, found in the review of host A's adoption)**: some OpenAI-compatible backends number
+  the call `call_0` in every reply, and `MaskToolResults` looked up results by call id across all messages, so
+  when an old batch was masked, the newest result that reused the same id was masked too, and the model did not
+  get the result it had just asked for. Changed so that each batch masks only the results in its own result
+  messages, and the tool name also comes from its own call message
+  (`test_a_call_id_reused_by_a_later_batch_does_not_mask_the_later_result`, red before the change); the
+  random-growth test also gained histories that reuse ids (it checks prefix stability and cannot catch this
+  error, so the unit test is responsible).
 
-- **C4 宿主 A（2026-11-26）**：宿主 A 的 agent tool loop（Temporal workflow 里）在每一步调用模型前用 `fit()`
-  （`MaskToolResults(keep_last=2)`，预算 150,000，system 和 tool 定义算作 `fixed`），把 `ContextState` 留在 workflow
-  内存里一步步传；装不下时 run 以失败结束。宿主自己写了约 50 行的 adapter（它的消息类型 ↔ 中立类型，往返无损）。
-  病例流程（按页分组、对半一次）没有换：语义与 `pack` / `halving` 不同（§15）。
-  测量（合成数据：宿主 A 只允许合成数据；20 步、每个 tool 结果都是 20,000 字符上限，真实的 system 和 tool 定义）：
-  | 预算 | 不 mask 时第 20 步的估算 token | 不 mask 时超预算的步数 | mask 后最大发送量 | 切点移动的步数 | 失败 |
+- **C4 host A (2026-11-26)**: host A's agent tool loop (inside a Temporal workflow) uses `fit()` before each
+  model call (`MaskToolResults(keep_last=2)`, budget 150,000, the system prompt and tool definitions counted as
+  `fixed`) and passes the `ContextState` along step by step in workflow memory; when it does not fit, the run
+  ends in failure. The host wrote an adapter of about 50 lines itself (its message types ↔ neutral types,
+  lossless round trip). The case flow (grouping by page, halving once) was not switched: its semantics differ
+  from `pack` / `halving` (§15).
+  Measured (synthetic data: host A allows only synthetic data; 20 steps, each tool result at the 20,000-character
+  cap, the real system prompt and tool definitions):
+  | Budget | Estimated tokens at step 20 without masking | Steps over budget without masking | Largest send after masking | Steps where the cut point moved | Failure |
   | --- | --- | --- | --- | --- | --- |
-  | 150,000（默认） | 110,013 | 0 | 110,013（什么都没 mask） | 0 | 否 |
-  | 60,000 | 110,013 | 9 / 20 | 53,039 | 4 / 20 | 否 |
-  即默认预算下行为不变；窗口小时，原本会失败的 9 步都能发出，prompt cache 只在 4 步失效。
-  接入发现并在库里修掉的：wheel 没有 `py.typed`（v0.1.1）；复用 call id 时最新结果被 mask（v0.1.2）。宿主侧另外
-  学到：lite-context 的任何异常都要结束 run 而不是让 workflow task 无限重试；`fit` 的 `DoesNotFit` 消息直接给用户
-  就够清楚（fixed 超预算的情况也说得出原因）。
-  通过条件：宿主 A 的 `make check` 全绿（后端 347、前端 33 + 51），超窗口失败在上表的场景里为 0，输入 token 不高于
-  接入前（默认预算下相等）。
-- **C4 宿主 B（2026-11-26，试接入后撤回，owner 决定先不改）**：下面是试接入的做法和测量，宿主 B 的代码已恢复原样，
-  补丁没有进宿主仓库。宿主 B 的 chat 接口（浏览器每轮发整段对话，Anthropic 格式的 dict）在调模型前
-  `fit()`：`MaskOpaque(keep_last=1)` 再 `DropOldest(keep_last_turns=4)`；预算是模型窗口与厂商每分钟额度中较小的
-  那个，减去回复的 `max_tokens`；system 和检索摘录算作 `fixed`。无状态（owner 决定）：不存 `ContextState`，
-  每轮重新算，所以过了 90% 以后切点每轮都可能移动、prompt cache 跟着失效。用内置的 Anthropic adapter，宿主
-  没写 adapter；裁掉东西时响应带计数，装不下回 413、不调模型。宿主 B 的全部测试当时通过（后端 822、前端 320）。
-  测量（合成数据：30 轮、每轮双方各约 2,000 字符，第 0/6/12/18/24 轮各带一个 20 页 PDF，第 30 轮约 234k 估算 token）：
-  | 窗口 | 不裁时超预算的轮数 | 裁后最大发送量 | 第 30 轮 | 失败 |
+  | 150,000 (default) | 110,013 | 0 | 110,013 (nothing masked) | 0 | no |
+  | 60,000 | 110,013 | 9 / 20 | 53,039 | 4 / 20 | no |
+  That is, behaviour is unchanged at the default budget; with a small window the 9 steps that would have failed
+  can all be sent, and the prompt cache is invalidated in only 4 steps.
+  Found during adoption and fixed in the library: the wheel had no `py.typed` (v0.1.1); the newest result was
+  masked when a call id was reused (v0.1.2). Also learned on the host side: any lite-context exception must end
+  the run rather than let the workflow task retry forever; `fit`'s `DoesNotFit` message is clear enough to give
+  straight to the user (the case of `fixed` over budget also states its reason).
+  Pass condition: host A's `make check` all green (backend 347, frontend 33 + 51), window-overflow failures are 0
+  in the scenarios of the table above, and input tokens are no higher than before adoption (equal at the default
+  budget).
+- **C4 host B (2026-11-26, trialled then reverted, the owner decided not to change it for now)**: below is what
+  the trial did and its measurements; host B's code has been restored to its original state, and the patches did
+  not go into the host repository. Host B's chat endpoint (the browser sends the whole conversation every turn,
+  as Anthropic-format dicts) calls `fit()` before the model call: `MaskOpaque(keep_last=1)` then
+  `DropOldest(keep_last_turns=4)`; the budget is the smaller of the model window and the vendor's per-minute
+  quota, minus the reply's `max_tokens`; the system prompt and the retrieval excerpts count as `fixed`. Stateless
+  (owner's decision): no `ContextState` is stored and it is recomputed every turn, so after 90% the cut point may
+  move every turn and the prompt cache is invalidated with it. It used the built-in Anthropic adapter, so the
+  host wrote no adapter; when something is trimmed the response carries counts, and when it does not fit it
+  returns 413 and does not call the model. All of host B's tests passed at that time (backend 822, frontend 320).
+  Measured (synthetic data: 30 turns, about 2,000 characters from each side per turn, a 20-page PDF on each of
+  turns 0/6/12/18/24, turn 30 at about 234k estimated tokens):
+  | Window | Turns over budget without trimming | Largest send after trimming | Turn 30 | Failure |
   | --- | --- | --- | --- | --- |
-  | 1,000,000（宿主 B 配置的 chat 模型） | 0 / 30 | 234,014（什么都没裁） | 不变 | 0 |
-  | 256,000 | 0 / 30 | 187,096 | 2 个文件换成占位 | 0 |
-  | 60,000（强制） | 24 / 30 | 48,658 | 4 个文件、50 条消息 | 0 |
-  试接入里学到的（都在宿主侧，库不用改；以后再接时照做）：
-  1. 估算要跟宿主**实际发出去的形态**走。宿主 B 对多数 OpenAI 协议厂商把 PDF 转成文字发（全部 PDF 合计最多
-     400,000 字符），按页数估会把以前能发的 70 页 PDF 判成 413。宿主用一个 `CharEstimate` 子类给 PDF 封顶。
-  2. 预算要看厂商的**每分钟额度**，不只是窗口：8,000 TPM 的档位上，超额度的请求直接被拒。最初照抄宿主读文档时
-     "留五分之一"的余量，结果把以前能答的长回复和长 system 都挡住了（第二轮 review 发现）。chat 一轮只有一个
-     请求，改成用满额度。
-  3. `DoesNotFit` 有两种原因：保留的轮次装不下，或者 fixed 本身就超了。给用户的消息要分开说，不能都说
-     "最新一条太大"。
+  | 1,000,000 (the chat model host B configures) | 0 / 30 | 234,014 (nothing trimmed) | unchanged | 0 |
+  | 256,000 | 0 / 30 | 187,096 | 2 files replaced by placeholders | 0 |
+  | 60,000 (forced) | 24 / 30 | 48,658 | 4 files, 50 messages | 0 |
+  Learned in the trial (all on the host side, the library needs no change; do the same when it is adopted again):
+  1. The estimate must follow the form the host **actually sends**. For most OpenAI-protocol vendors host B turns
+     a PDF into text before sending (at most 400,000 characters over all PDFs together), and estimating by page
+     count would judge a 70-page PDF that used to be sendable as a 413. The host uses a `CharEstimate` subclass
+     to cap PDFs.
+  2. The budget must look at the vendor's **per-minute quota**, not only the window: on an 8,000 TPM tier a
+     request over the quota is simply rejected. At first the host copied the "keep a fifth in reserve" margin
+     from its document reading, which blocked long replies and long system prompts that used to be answerable
+     (found in the second round of review). A chat turn is only one request, so it was changed to use the full
+     quota.
+  3. `DoesNotFit` has two causes: the kept turns do not fit, or `fixed` itself is over. The message to the user
+     has to tell them apart and cannot say "the latest one is too large" for both.
 
-- **C5（2026-11-26）**：`Transcript`（异步）、`InMemoryStore`、`PgStore`（extra `pg`）、消息的 JSON codec、
-  `litecontext migrate` / `pending`，版本 0.2.0。验收：store 的同一组契约测试在内存和 PG 上都跑（顺序读回、
-  `expected_seq` 不对时什么都不写、批的 seq 必须接上、未知 transcript、8 个并发 append 恰好一个成功）；PG 上
-  UPDATE / DELETE / TRUNCATE 被 trigger 拒绝；同一段会增长、会 mask、会写一次摘要的脚本对话，内存和 PG 每一步的
-  投影逐字节相同；另一个进程（`python -I`）从 PG 读回后投影相同。核心仍不加载任何第三方模块（干净的 3.11 venv
-  里装 wheel，smoke 通过，`psycopg` 没被导入）。
-  变异检查发现两处测试没咬住，已补：去掉 PG 的 `FOR UPDATE` 时并发测试仍通过（测试 store 的连接池起始只有 1 个连接，
-  并发 append 其实是排队的；改成起始 4 个连接后，去掉锁会出 `UniqueViolation`、测试失败）；投影用第一条而不是最新一条
-  状态时测试仍通过（只存过一条状态；补了先存 mask 状态再摘要的用例）。
-  收尾：`/simplify` 四个角度 + review（Codex 额度用完到 2026-12-18，用 Claude 子代理代替）。review 发现并修掉（都先写了
-  失败的测试）：codec 写入时不检查读回时检查的类型，`pinned=1` 一类的消息能写进去、之后整个 transcript 读不出来；
-  NUL / 孤立 surrogate 内存 store 收、PG 报 psycopg 原始异常；第一次连接失败后 store 永久不可用（关掉的连接池不能
-  再开）；连上以后的数据库错误不是 `StoreError`；jsonb 重排 key。simplify 采纳：存储层独立成 `store.py`（pg 不再
-  经 transcript 导入 fit）、`check_batch` 同时检查尾部、schema 检查移进 `migrate` / `pending`、状态的编码移进 codec、
-  codec 的允许值从 `types` 的 Literal 取、测试共用一个 `keyless_turn` 和 `fresh_schema`、网络守卫只在要了 `pg_url`
-  的测试里放行数据库主机。没采纳：大 PDF 每次 append 被序列化约 3 次、`project()` 每次读整个日志（现在没有宿主
-  在 transcript 里存大文件；以后用类型遍历代替 dumps/loads、按 `after` 增量读）。
+- **C5 (2026-11-26)**: `Transcript` (async), `InMemoryStore`, `PgStore` (extra `pg`), the message JSON codec,
+  `litecontext migrate` / `pending`, version 0.2.0. Acceptance: the same set of store contract tests runs on both
+  memory and PG (read back in order, nothing written when `expected_seq` is wrong, a batch's seqs must follow on,
+  an unknown transcript, 8 concurrent appends with exactly one succeeding); on PG UPDATE / DELETE / TRUNCATE are
+  rejected by the trigger; for a scripted conversation that grows, masks and writes one summary, the projection
+  of memory and PG is byte for byte the same at every step; another process (`python -I`) reads back from PG and
+  gets the same projection. The core still loads no third-party module (the wheel installed in a clean 3.11
+  venv, smoke passed, `psycopg` was not imported).
+  Mutation checking found two places the tests did not bite, and they were added: with PG's `FOR UPDATE` removed
+  the concurrency test still passed (the test store's connection pool started with only 1 connection, so the
+  concurrent appends were in fact queued; after changing it to start with 4 connections, removing the lock gives
+  `UniqueViolation` and the test fails); with the projection using the first state rather than the latest one
+  the tests still passed (only one state had ever been stored; a case that stores a mask state first and then a
+  summary was added).
+  Close-out: `/simplify` from four angles + review (Codex quota used up until 2026-12-18, a Claude subagent in its
+  place). Review found and fixed (a failing test was written first each time): the codec did not check at write
+  time the types it checks at read time, so a message like `pinned=1` could be written and then the whole
+  transcript could not be read; NUL / a lone surrogate was accepted by the in-memory store and made PG raise
+  psycopg's raw exception; after a first connection failure the store was unusable for good (a closed connection
+  pool cannot be reopened); a database error after connecting was not a `StoreError`; jsonb reordering keys.
+  Simplify accepted: the storage layer became its own `store.py` (pg no longer imports fit through transcript),
+  `check_batch` also checks the tail, the schema check moved into `migrate` / `pending`, state encoding moved into
+  the codec, the codec's allowed values are taken from `types`' Literal, tests share one `keyless_turn` and
+  `fresh_schema`, and the network guard lets the database host through only in tests that asked for `pg_url`.
+  Not accepted: a large PDF being serialised about 3 times per append, and `project()` reading the whole log every
+  time (no host stores large files in a transcript now; later use a type walk in place of dumps/loads and an
+  incremental read by `after`).
 
-- **C6（2026-11-26）**：REST 壳 `litecontext serve`（extra `server`，§9），版本 0.3.0。库里为它加了两个函数：
-  `Transcript.plan_compaction()`（摘要的 plan 和当时的尾部 seq，`compact()` 也改用它）和
-  `compaction.accept_summary()`（从 plan 的几个部分接受摘要，`CompactionPlan.accept` 委托给它），这样壳里没有摘要
-  逻辑。验收：每个端点与库在同一输入上的输出逐字段相同（三种格式的 fit、摘要 plan / accept、split / pack / select、
-  transcript 的整段脚本在内存和 PG 上都比过）；只能绑回环地址；声明或实际超过上限的请求体 413（声明超了一字节都不读）。
-  手动起过一次（8750 先确认空闲，用完关掉）：`/v1/fit` 把旧的 tool 结果 mask 掉，145 → 49 估算 token；外来 Host 400。
-  收尾：`/simplify` + review（Codex 额度用完，Claude 子代理）。review 发现并修掉（先写失败的测试）：`heading` 不是合法
-  正则时 500；请求体按块拼接是平方级（30 MB、4 KB 一块要 9.5 秒，阻塞事件循环；改成 bytearray）；CLI 的端口、
-  请求体上限是坏值时抛 traceback（而且坏的端口会让 `pending` 都起不来）；库里 OpenAI adapter 把内容不是文本的 system
-  消息算作空文本放过去（现在 `UnsupportedInput`）。simplify 采纳：一个全局的错误处理代替每个路由的包装、摘要策略
-  字段合成一个 mixin、状态的编码走 codec、`accept_summary` 进库、`entries(after=)` 交给 store 过滤。变异检查 16 处都
-  被测试抓到；中途发现一个测试缺陷：改坏 `check_host` 时 `serve` 的测试会真的启动 uvicorn，现在 CLI 测试一律先把
-  `uvicorn.run` 换成会失败的桩。没采纳：错误码做成异常类的属性（现在由类名推出，改名会变——以后有第二个壳时再定）；
-  `heading` 正则的 ReDoS 只靠回环地址和 200 字符上限（Python `re` 没有超时）。
-  修完再 review 一轮：没有新 bug；两处小问题已修——带 NUL 的 transcript id 在 PG 上是 503（现在 `Transcript` 自己按和
-  codec 一样的规则检查 id，1–200 字符，所有 store 都 422）；请求体上限的报错提到一个不存在的 `--max_body` 参数。
-  接受的取舍：库里的 `ValueError` 都按 422 返回，库自身的 bug 若以 `ValueError` 出现也会是 422 而不是 500。
+- **C6 (2026-11-26)**: the REST shell `litecontext serve` (extra `server`, §9), version 0.3.0. Two functions were
+  added to the library for it: `Transcript.plan_compaction()` (the summary's plan and the tail seq at that time;
+  `compact()` was changed to use it too) and `compaction.accept_summary()` (accepts a summary from the parts of a
+  plan; `CompactionPlan.accept` delegates to it), so that the shell has no summary logic. Acceptance: every
+  endpoint's output equals the library's on the same input field by field (fit in the three formats, summary plan
+  / accept, split / pack / select, and the transcript's whole script were compared on both memory and PG); it can
+  bind only to a loopback address; a request body over the limit, declared or actual, gets 413 (when the declared
+  size is over, not a byte is read). Started by hand once (8750 confirmed free first, shut down afterwards):
+  `/v1/fit` masked the old tool results, 145 → 49 estimated tokens; a foreign Host got 400.
+  Close-out: `/simplify` + review (Codex quota used up, a Claude subagent). Review found and fixed (a failing test
+  first): `heading` that is not a valid regular expression gave 500; joining the request body block by block was
+  quadratic (30 MB in 4 KB blocks took 9.5 seconds and blocked the event loop; changed to a bytearray); a bad
+  port or body limit in the CLI threw a traceback (and a bad port even stopped `pending` from starting); the
+  library's OpenAI adapter let through a system message whose content was not text, counting it as empty text
+  (now `UnsupportedInput`). Simplify accepted: one global error handler in place of a wrapper on each route, the
+  summary-policy fields merged into one mixin, state encoding going through the codec, `accept_summary` moved
+  into the library, `entries(after=)` left to the store to filter. Mutation checking: all 16 places were caught
+  by tests; a test defect was found along the way: when `check_host` was broken, the `serve` test really started
+  uvicorn, and now the CLI tests always replace `uvicorn.run` with a stub that fails first. Not accepted: making
+  the error code an attribute of the exception class (it is now derived from the class name, so a rename would
+  change it — decide when there is a second shell); the `heading` regular expression's ReDoS is covered only by
+  the loopback address and the 200-character cap (Python `re` has no timeout).
+  Another round of review after the fixes: no new bugs; two small problems fixed — a transcript id with a NUL was
+  a 503 on PG (now `Transcript` itself checks the id by the same rule as the codec, 1–200 characters, and every
+  store gives 422); the error for the request-body limit mentioned a `--max_body` parameter that does not exist.
+  Accepted trade-off: every `ValueError` in the library is returned as 422, so a bug in the library itself that
+  appears as a `ValueError` would also be 422 rather than 500.
 
-- **C7（2026-11-26）**：lite-agent v0.2.5 的压缩器改用 lite-context 0.3.1（在 lite-agent 仓库里做，owner 决定：lite-context 是它的
-  核心依赖、范围只到压缩）。提问（`ASK` / `END`）、摘要外框（`SUMMARY`）、transcript 渲染（新公开的 `render_transcript`）
-  来自这里；lite-agent 自己保留切点（按 `model_turn`、在事件 seq 上，`plan_compaction` 按人的轮次、在带 key 的消息上，不适用）
-  和去掉抄回头标的规则（任何十六进制头标）。所以 C7 行里说的"它提供自己的 `SummaryPolicy`"最后不需要：它不调
-  `plan_compaction` / `accept`，只用渲染和外框。验收：lite-agent 的 38 个已有测试文件 sha256 前后相同、503 个测试一行没改全部通过；
-  用 v0.2.4 代码生成的金标准逐字节相同；review 用 2 万段随机历史对比新旧实现，loop 可达的路径上没有差别。fit() / masking
-  没有接进 lite-agent（owner 选的范围）。C0–C7 全部完成。
+- **C7 (2026-11-26)**: lite-agent v0.2.5's compactor switched to lite-context 0.3.1 (done in the lite-agent
+  repo; the owner decided: lite-context is its core dependency, and the scope goes only as far as compaction).
+  The prompt (`ASK` / `END`), the summary frame (`SUMMARY`) and the transcript rendering (the newly public
+  `render_transcript`) come from here; lite-agent keeps its own cut point (by `model_turn`, on event seqs, while
+  `plan_compaction` goes by human turn, on messages with keys, so does not apply) and its rule for removing
+  copied-back headers (any hexadecimal header). So the C7 row's "it provides its own `SummaryPolicy`" turned out
+  not to be needed: it does not call `plan_compaction` / `accept` and uses only the rendering and the frame.
+  Acceptance: the sha256 of lite-agent's 38 existing test files is the same before and after, and all 503 tests
+  pass without changing a line; the golden outputs generated with the v0.2.4 code are byte for byte the same;
+  the review compared the old and new implementations over 20,000 random histories, with no difference on the
+  paths a loop can reach. fit() / masking was not wired into lite-agent (the scope the owner chose). C0–C7 are
+  all done.
 
-## 15. 待确认
+## 15. Open questions
 
-- **厂商的 count_tokens**：宿主 B 对 Claude 用 SDK 的 `messages.count_tokens`（一次网络调用）。核心的 `Counter`
-  是同步的；要不要加一个 async 计数器，或让宿主先算好再传 `Opaque.tokens` / 预算，C4 接入时定。
-  C4 结论（宿主 B）：chat 用估算够用；文档的切分 / 对半 / 分层 reduce 因此没换，`split` / `halving` /
-  `reduce_tree` 的 cost 若能是 async（或接受预先算好的数），宿主 B 才能换过来。
-  v0.3.2 结论：用校准，不做 async 计数器（§4）——宿主 B 自己的文档工具本来就是"整篇数一次、算出比例"，换过来时
-  照这个做（宿主 B 暂缓，owner 决定）。
-- ~~**数不出页数的 PDF**~~（C4 宿主 B）：v0.3.2 解决——压缩对象流解压后再数、再看页树的 `/Count`（§4）；没有按字节数
-  猜。
-- **报告的汇总**：两个宿主都自己按 `Action.what` 数了"mask 了几个 / 丢了几条"。若第三个宿主也要，`Report` 加一个
-  汇总方法。
-- **摘要质量怎么测**：masking 和摘要哪个更好，公开结果是 reported。C4 之后用 lite-eval 在宿主的真实任务上对比，
-  测之前不在文档里推荐其中一个做默认。
-  第一次实测（2026-11-26，lite-agent 的长任务评测；合成任务，qwen3:8b，每个任务每种配置 3 次）：masking 先于摘要时，
-  投入的 token 少 32%、时间少 57%，但模型只用还看得见的最后一两份结果作答，看不见的就编（延误货物的真实重量答对
-  9/45，只开摘要 22/45；第一份报告的重量 0/3 对 3/3）；占位符让它重读，9 次运行里 0 次照做。lite-agent 因此默认不开
-  masking。还不是"宿主的真实任务"，这一项继续开着；下一步是占位符本身（`MASKED_RESULT` 是固定常量，§5.2 规则 6）
-  或更强的模型。记录：lite-agent 设计 §15 / §16（github.com/ArthurGao/lite-agent，`docs/lite-agent-design.md`），
-  KB `global/llm-evals/evals/2026-11-26-lite-agent-masking-long.md`。
-- **服务端摘要**：REST 模式下由服务自己调 lite-model role 写摘要（§0 里"以后的可选项"）。有非 Python 宿主要用时再做。
-- **token 级压缩**（LLMLingua 一类）：需要本地小模型，适合长文档不适合历史；有宿主要用时作为 §7 的可选步骤。
-- **Python 3.11 的下限**：宿主 B 升到 3.12 后，是否提到 3.12 与其它 lite 模块一致。
-- **项目 KB 的位置**：`KB/projects/lite-context/`（S0 创建）。
-- **`pack` 要不要允许单个超预算的单元自成一组**（C4 宿主 A）：宿主 A 的按页分组让一页超预算时自成一组、交给模型
-  （模型拒绝时再对半一次），`pack` 则直接 `DoesNotFit`。宿主 A 的病例流程这次不改（它的 §8.3 是有意的设计）；
-  等有宿主需要时再加一个选项。
+- **A vendor's count_tokens**: for Claude host B uses the SDK's `messages.count_tokens` (a network call). The
+  core's `Counter` is synchronous; whether to add an async counter, or to let the host compute first and pass
+  `Opaque.tokens` / the budget, was to be decided when C4 was adopted.
+  C4 conclusion (host B): the estimate is good enough for chat; document split / halving / tree reduce were
+  therefore not switched, and host B could switch them over only if the cost of `split` / `halving` /
+  `reduce_tree` could be async (or accepted a precomputed number).
+  v0.3.2 conclusion: use calibration, no async counter (§4) — host B's own document tools already "count a whole
+  document once and work out the ratio", so do it that way when it is switched over (host B is deferred, the
+  owner's decision).
+- ~~**A PDF whose pages cannot be counted**~~ (C4 host B): solved in v0.3.2 — inflate the compressed object
+  streams and count again, then look at the page tree's `/Count` (§4); no guessing from the byte size.
+- **Summarising the report**: both hosts counted "how many masked / how many dropped" themselves by
+  `Action.what`. If a third host needs it too, add a summary method to `Report`.
+- **How to measure summary quality**: which of masking and summaries is better is a reported public result. After
+  C4, compare them with lite-eval on a host's real tasks, and before measuring, this document does not recommend
+  either one as the default.
+  First measurement (2026-11-26, lite-agent's long-task eval; synthetic tasks, qwen3:8b, 3 runs per task per
+  configuration): with masking before summaries, 32% fewer tokens and 57% less time were spent, but the model
+  answered using only the last one or two results still visible and made up the ones it could not see (the true
+  weight of a delayed shipment answered correctly 9/45, with summaries only 22/45; the first report's weight 0/3
+  correct against 3/3); the placeholder told it to re-read, and in 9 runs it did so 0 times. lite-agent therefore
+  does not turn masking on by default. This is still not "a host's real tasks", so this item stays open; the next
+  step is the placeholder itself (`MASKED_RESULT` is a fixed constant, §5.2 rule 6) or a stronger model. Record:
+  lite-agent design §15 / §16 (github.com/ArthurGao/lite-agent, `docs/lite-agent-design.md`), KB
+  `global/llm-evals/evals/2026-11-26-lite-agent-masking-long.md`.
+- **Server-side summaries**: in REST mode the service calls a lite-model role itself to write the summary
+  ("a later option" in §0). To be done when a non-Python host wants it.
+- **Token-level compression** (LLMLingua and the like): needs a small local model, suits long documents rather
+  than history; when a host wants it, it is added as an optional step of §7.
+- **The Python 3.11 floor**: once host B moves up to 3.12, whether to raise it to 3.12 like the other lite
+  modules.
+- **Where the project KB lives**: `KB/projects/lite-context/` (created in S0).
+- **Whether `pack` should allow a single over-budget unit to form a group of its own** (C4 host A): host A's
+  page grouping lets a page over budget form its own group and hands it to the model (and halves once more if the
+  model rejects it), whereas `pack` goes straight to `DoesNotFit`. Host A's case flow is not changed this time
+  (its §8.3 is a deliberate design); an option is added when a host needs it.

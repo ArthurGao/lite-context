@@ -842,6 +842,12 @@ lite-context/
   汇总方法。
 - **摘要质量怎么测**：masking 和摘要哪个更好，公开结果是 reported。C4 之后用 lite-eval 在宿主的真实任务上对比，
   测之前不在文档里推荐其中一个做默认。
+  第一次实测（2026-11-26，lite-agent 的长任务评测；合成任务，qwen3:8b，每个任务每种配置 3 次）：masking 先于摘要时，
+  投入的 token 少 32%、时间少 57%，但模型只用还看得见的最后一两份结果作答，看不见的就编（延误货物的真实重量答对
+  9/45，只开摘要 22/45；第一份报告的重量 0/3 对 3/3）；占位符让它重读，9 次运行里 0 次照做。lite-agent 因此默认不开
+  masking。还不是"宿主的真实任务"，这一项继续开着；下一步是占位符本身（`MASKED_RESULT` 是固定常量，§5.2 规则 6）
+  或更强的模型。记录：lite-agent 设计 §15 / §16（github.com/ArthurGao/lite-agent，`docs/lite-agent-design.md`），
+  KB `global/llm-evals/evals/2026-11-26-lite-agent-masking-long.md`。
 - **服务端摘要**：REST 模式下由服务自己调 lite-model role 写摘要（§0 里"以后的可选项"）。有非 Python 宿主要用时再做。
 - **token 级压缩**（LLMLingua 一类）：需要本地小模型，适合长文档不适合历史；有宿主要用时作为 §7 的可选步骤。
 - **Python 3.11 的下限**：宿主 B 升到 3.12 后，是否提到 3.12 与其它 lite 模块一致。

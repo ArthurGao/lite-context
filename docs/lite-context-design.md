@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C4 宿主 A 已接入（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -22,6 +22,8 @@ LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时�
 | 2026-11-26 | Python ≥ 3.11，CI 跑 3.11 和 3.12 | owner | 宿主 B 跑 3.11；纯 Python 库支持 3.11 的成本很低 |
 | 2026-11-26 | 核心零运行时依赖；lite-model adapter、tiktoken 计数器、PostgreSQL、FastAPI 各是一个 extra | 提议 | 宿主 B 用 pip requirements，依赖越少越容易接；核心是纯数据处理 |
 | 2026-11-26 | 宿主 A、B 在 C4 同时接入 | owner | 一次验证两种接入形态：tool loop 的 masking，和 chat 历史的预算 + 摘要 |
+| 2026-11-26 | 宿主 B 的 chat 无状态裁剪：每次请求重新 `fit()`，不存 `ContextState`、不做摘要、不加 migration；文档的切分 / 对半 / reduce 先不换 | owner | 先用最小改动拿到"装得下"；cache 稳定和摘要等有长对话的测量再说。宿主 B 的文档工具用厂商 async `count_tokens` 计精确数，核心的 cost 是同步的（§15） |
+| 2026-11-26 | 宿主 B 先不改：试接入做完、review 过后整体撤回，宿主 B 保持原样 | owner | 未说明原因；试接入的补丁和学到的东西留在下面 §14 的记录里，以后再接时用 |
 | 2026-11-26 | 收尾流程与其它 lite 模块相同：`/simplify` → Codex 只读 review → 修复或写下否决理由 → 重跑全部检查 | owner | workspace 约定 |
 
 ## 1. 概述
@@ -422,7 +424,7 @@ HTTP 壳一样，等有宿主要从别的机器访问时再定。壳里没有逻
 | 项目 | 关系 |
 | --- | --- |
 | 宿主 A（Python 3.12，uv，自有 LLM 层和类型，Temporal 里的 tool loop） | C4：tool loop 每一步先 `fit()`（`TruncateToolResults` + `MaskToolResults`），代替现在只在产生时截断；纯函数，留在 workflow 里；摘要走一个新的 activity。文档的按页分组和对半重试换成 §7 |
-| 宿主 B（Python 3.11，pip，Anthropic 格式的 dict，chat 历史在 PostgreSQL 里由 TypeScript 服务持有） | C4：chat 请求进 Python 时先 `fit()`；`ContextState` 存在 thread 上（宿主自己的 migration）；文档的切分、对半重试、分层 reduce 换成 §7 |
+| 宿主 B（Python 3.11，pip，Anthropic 格式的 dict，chat 历史在 PostgreSQL 里由 TypeScript 服务持有） | C4 暂缓（owner 2026-11-26）：试过 chat 请求进 Python 时先 `fit()`（`MaskOpaque` + `DropOldest`，无状态），已撤回；文档工具不换（§15） |
 | lite-agent | C7：依赖 lite-context，把事件映射成中立 `Message`，它的 `SummaryCompactor` 和投影里的遮盖规则改用 lite-context。需要改它的设计（规则 8：lite-model 是唯一的 lite 依赖） |
 | lite-model | 不依赖。`lite_model` adapter 是 extra，版本跟 workspace pin |
 | lite-rag、lite-mem | 不依赖。lite-rag 负责检索和排序，§7 的 `select` 只在它排好的结果里挑 |
@@ -706,12 +708,39 @@ lite-context/
   学到：lite-context 的任何异常都要结束 run 而不是让 workflow task 无限重试；`fit` 的 `DoesNotFit` 消息直接给用户
   就够清楚（fixed 超预算的情况也说得出原因）。
   通过条件：宿主 A 的 `make check` 全绿（后端 347、前端 33 + 51），超窗口失败在上表的场景里为 0，输入 token 不高于
-  接入前（默认预算下相等）。宿主 B 尚未接入。
+  接入前（默认预算下相等）。
+- **C4 宿主 B（2026-11-26，试接入后撤回，owner 决定先不改）**：下面是试接入的做法和测量，宿主 B 的代码已恢复原样，
+  补丁没有进宿主仓库。宿主 B 的 chat 接口（浏览器每轮发整段对话，Anthropic 格式的 dict）在调模型前
+  `fit()`：`MaskOpaque(keep_last=1)` 再 `DropOldest(keep_last_turns=4)`；预算是模型窗口与厂商每分钟额度中较小的
+  那个，减去回复的 `max_tokens`；system 和检索摘录算作 `fixed`。无状态（owner 决定）：不存 `ContextState`，
+  每轮重新算，所以过了 90% 以后切点每轮都可能移动、prompt cache 跟着失效。用内置的 Anthropic adapter，宿主
+  没写 adapter；裁掉东西时响应带计数，装不下回 413、不调模型。宿主 B 的全部测试当时通过（后端 822、前端 320）。
+  测量（合成数据：30 轮、每轮双方各约 2,000 字符，第 0/6/12/18/24 轮各带一个 20 页 PDF，第 30 轮约 234k 估算 token）：
+  | 窗口 | 不裁时超预算的轮数 | 裁后最大发送量 | 第 30 轮 | 失败 |
+  | --- | --- | --- | --- | --- |
+  | 1,000,000（宿主 B 配置的 chat 模型） | 0 / 30 | 234,014（什么都没裁） | 不变 | 0 |
+  | 256,000 | 0 / 30 | 187,096 | 2 个文件换成占位 | 0 |
+  | 60,000（强制） | 24 / 30 | 48,658 | 4 个文件、50 条消息 | 0 |
+  试接入里学到的（都在宿主侧，库不用改；以后再接时照做）：
+  1. 估算要跟宿主**实际发出去的形态**走。宿主 B 对多数 OpenAI 协议厂商把 PDF 转成文字发（全部 PDF 合计最多
+     400,000 字符），按页数估会把以前能发的 70 页 PDF 判成 413。宿主用一个 `CharEstimate` 子类给 PDF 封顶。
+  2. 预算要看厂商的**每分钟额度**，不只是窗口：8,000 TPM 的档位上，超额度的请求直接被拒。最初照抄宿主读文档时
+     "留五分之一"的余量，结果把以前能答的长回复和长 system 都挡住了（第二轮 review 发现）。chat 一轮只有一个
+     请求，改成用满额度。
+  3. `DoesNotFit` 有两种原因：保留的轮次装不下，或者 fixed 本身就超了。给用户的消息要分开说，不能都说
+     "最新一条太大"。
 
 ## 15. 待确认
 
 - **厂商的 count_tokens**：宿主 B 对 Claude 用 SDK 的 `messages.count_tokens`（一次网络调用）。核心的 `Counter`
   是同步的；要不要加一个 async 计数器，或让宿主先算好再传 `Opaque.tokens` / 预算，C4 接入时定。
+  C4 结论（宿主 B）：chat 用估算够用；文档的切分 / 对半 / 分层 reduce 因此没换，`split` / `halving` /
+  `reduce_tree` 的 cost 若能是 async（或接受预先算好的数），宿主 B 才能换过来。
+- **数不出页数的 PDF**（C4 宿主 B）：PDF 1.5 以后常把页对象放进压缩的 object stream，`pdf_pages` 找不到页，
+  按 `opaque_default`（1,500）计，会低估大文件。可以退到按字节数估。目前宿主 B 的客户端自己还会再检查一次，
+  所以不是回归。
+- **报告的汇总**：两个宿主都自己按 `Action.what` 数了"mask 了几个 / 丢了几条"。若第三个宿主也要，`Report` 加一个
+  汇总方法。
 - **摘要质量怎么测**：masking 和摘要哪个更好，公开结果是 reported。C4 之后用 lite-eval 在宿主的真实任务上对比，
   测之前不在文档里推荐其中一个做默认。
 - **服务端摘要**：REST 模式下由服务自己调 lite-model role 写摘要（§0 里"以后的可选项"）。有非 Python 宿主要用时再做。

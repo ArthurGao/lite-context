@@ -30,8 +30,10 @@ the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (d
 `testing.check_step` (design §5). **C1b done 2026-11-26**: summaries — `plan_compaction`, `accept`, `acompact`,
 `SummaryPolicy`, applied by `fit()` under the same checks (design §6). C1 is complete. **C2 done 2026-11-26**:
 long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). **C3 done 2026-11-26: v0.1.0
-released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a uv 3.12 project). Next: C4 — hosts
-A and B adopt it, in their own repositories (design §12, §14).
+released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a uv 3.12 project); v0.1.1 (`py.typed`),
+v0.1.2 (reused call ids). **C4 2026-11-26: host A adopted it** in its own repository; host B was trialled and reverted, deferred
+by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). Next: C5 —
+`Transcript` and stores, unless the owner resumes host B first.
 
 ## Rules
 

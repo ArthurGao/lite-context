@@ -312,3 +312,32 @@ def test_accepting_from_the_plan_s_parts_equals_accepting_the_plan() -> None:
     assert by_parts == plan.accept("S", provenance={"m": 1}, now=NOW)
     with pytest.raises(ValueError, match="covered"):
         accept_summary("S", covered=(), mark="m0", policy=POLICY, now=NOW)
+
+
+def test_the_transcript_alone_is_the_rendered_prompt_without_its_closing_line() -> None:
+    from lite_context.compaction import render_transcript
+
+    msgs = history(3)
+    _, transcript = POLICY.render("m0", None, msgs)
+    assert render_transcript("m0", msgs) + END.format(mark="m0") == transcript
+    assert "end of the transcript" not in render_transcript("m0", msgs)
+    assert render_transcript("m0", []) == ""
+
+
+def test_a_policy_that_frames_summaries_its_own_way_is_the_one_accept_uses() -> None:
+    from dataclasses import dataclass
+
+    from lite_context.compaction import accept_summary
+
+    @dataclass(frozen=True)
+    class Shouting(SummaryPolicy):
+        def wrap(self, mark: str, reply: str) -> str:
+            return reply.strip().upper()
+
+    policy = Shouting(keep_last_turns=1, mark="m0")
+    plan = plan_compaction(history(3), policy=policy)
+    assert plan is not None
+    state = plan.accept("they asked", now=NOW)
+    assert state.compaction is not None and state.compaction.text == "THEY ASKED"
+    again = accept_summary("x", covered=plan.covered, mark="m0", policy=policy, now=NOW)
+    assert again.compaction is not None and again.compaction.text == "X"

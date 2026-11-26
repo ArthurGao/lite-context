@@ -65,8 +65,7 @@ class SummaryPolicy:
         """The system text and the transcript to summarise; `previous` is the earlier summary
         without its preamble."""
         parts = [f"--- {mark} earlier summary ---\n{previous}"] if previous else []
-        for m in messages:
-            parts += _render(mark, m)
+        parts += [part for m in messages for part in _render(mark, m)]
         return ASK.format(mark=mark), "\n\n".join(parts) + END.format(mark=mark)
 
     def wrap(self, mark: str, reply: str) -> str:
@@ -79,6 +78,12 @@ class SummaryPolicy:
     def unwrap(self, text: str) -> str:
         """A stored summary without its preamble, to give back to the summariser."""
         return text.removeprefix(_PREAMBLE)
+
+
+def render_transcript(mark: str, messages: Sequence[Message]) -> str:
+    """The messages as the transcript's parts, without the closing instruction (`END`): for a
+    host that renders the history its own way around them (lite-agent's compactor)."""
+    return "\n\n".join(part for m in messages for part in _render(mark, m))
 
 
 def _render(mark: str, m: Message) -> list[str]:
@@ -269,4 +274,5 @@ __all__ = [
     "acompact",
     "covered_end",
     "plan_compaction",
+    "render_transcript",
 ]

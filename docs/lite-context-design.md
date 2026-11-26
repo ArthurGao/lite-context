@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：v0.3.1（2026-11-26）：公开 `render_transcript`，给 lite-agent（C7）用；C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -328,7 +328,7 @@ if fitted.report.compaction_due:
   摘要算失败，不能顶替历史。这几条沿用 lite-agent S3b。
 - **`SummaryPolicy` 是可替换的**：`keep_last_turns`、`render(previous, messages) -> (system, transcript)`、
   `wrap(mark, reply) -> text`、`unwrap(text)`。`mark` 每个 plan 定一次、记在 plan 上，`wrap` 只去掉带这个 mark 的
-  头标行（任何字符串的 mark 都行）；前一次的摘要去掉前言再交给模型，免得前言被抄进新摘要、再套一层。默认 policy 照搬 lite-agent 实测过的做法（它的 §15 S3b）：transcript 的每一段以带随机
+  头标行（任何字符串的 mark 都行）；前一次的摘要去掉前言再交给模型，免得前言被抄进新摘要、再套一层。`render_transcript(mark, messages)`（v0.3.1）给出不带结尾 `END` 的那一段，给自己拼提问的宿主用（lite-agent 的压缩器，C7）。默认 policy 照搬 lite-agent 实测过的做法（它的 §15 S3b）：transcript 的每一段以带随机
   token 的头标开头（tool 结果里的文字冒充不了用户）；说明在 transcript 之后再说一遍（小模型否则会回答 transcript
   里最后一个问题，6 次里 6 次）；去掉回复里抄进来的头标行；thinking 块不进 transcript，图片写成 `[image]`；前一次的
   摘要作为第一段 `earlier summary` 放进去。`mark` 可以传入（测试用），默认每次随机。lite-agent 在 C7 提供它自己的

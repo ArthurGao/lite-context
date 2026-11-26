@@ -1,4 +1,6 @@
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from lite_context import (
     Budget,
@@ -99,3 +101,40 @@ def test_a_char_estimate_with_impossible_numbers_is_refused(kwargs: dict[str, fl
 def test_fixed_token_counts_must_be_non_negative_ints(fixed: list[int]) -> None:
     with pytest.raises(ValueError, match="fixed"):
         Budget(limit=10, reserve_output=0).available(fixed, EST)
+
+
+# --- calibration: one exact count by the host makes the estimate exact for that text ---
+
+
+def test_a_calibrated_estimate_takes_its_ratio_from_one_exact_count() -> None:
+    text = "word " * 1000  # 5,000 characters the vendor counted as 1,250 tokens
+    est = CharEstimate(image_tokens=900).calibrated(text, 1_250)
+    assert est.chars_per_token == 4.0
+    assert est.text(text) == 1_250
+    assert est.image_tokens == 900  # everything else is kept
+
+
+def test_split_with_a_calibrated_counter_is_split_with_that_ratio() -> None:
+    from lite_context.docs import split
+
+    text = "\n".join(f"line {i} " + "x" * 50 for i in range(400))
+    calibrated = CharEstimate().calibrated(text, len(text) // 5)
+    by_ratio = CharEstimate(chars_per_token=len(text) / (len(text) // 5))
+    assert split(text, max_tokens=900, counter=calibrated) == split(
+        text, max_tokens=900, counter=by_ratio
+    )
+    assert len(split(text, max_tokens=900, counter=calibrated)) > 1
+
+
+@pytest.mark.parametrize(
+    "text, tokens", [("", 10), ("abc", 0), ("abc", -1), ("abc", 2.5), ("abc", True)]
+)
+def test_a_calibration_from_nothing_is_refused(text: str, tokens: object) -> None:
+    with pytest.raises(ValueError, match="calibrat"):
+        CharEstimate().calibrated(text, tokens)  # type: ignore[arg-type]
+
+
+@given(st.integers(min_value=1, max_value=200_000), st.integers(min_value=1, max_value=200_000))
+def test_the_calibrating_text_counts_exactly_what_was_measured(chars: int, tokens: int) -> None:
+    text = "x" * chars
+    assert CharEstimate().calibrated(text, tokens).text(text) == tokens

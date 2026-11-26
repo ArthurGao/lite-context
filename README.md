@@ -1,6 +1,6 @@
 # lite-context
 
-**v0.3.0** (2026-11-26; stage plan: design §14).
+**v0.3.2** (2026-11-26; stage plan: design §14).
 
 lite-context decides **what the model should see in this call**. Give it your full history (or a set of
 documents or retrieved chunks) and a token budget. It returns what to send this time and a report of what it
@@ -28,9 +28,9 @@ LLM layer.
 From the GitHub Release (lite-context is not on PyPI). Python 3.11 or 3.12, no dependencies:
 
 ```
-uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"
-pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"
-pip install "lite-context[pg,server] @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"   # PgStore, REST shell
+uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.2/lite_context-0.3.2-py3-none-any.whl"
+pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.2/lite_context-0.3.2-py3-none-any.whl"
+pip install "lite-context[pg,server] @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.2/lite_context-0.3.2-py3-none-any.whl"   # PgStore, REST shell
 ```
 
 ## Example
@@ -101,6 +101,10 @@ curl -s http://127.0.0.1:8750/v1/fit -H 'content-type: application/json' -d '{
 ```
 
 Every endpoint is in design §9.
+
+Exact counts for long documents: count the whole text once with your vendor, then calibrate the estimate
+(`counter = CharEstimate().calibrated(text, await my_llm.count_tokens(text))`) and pass it to `split` or use its
+`text()` as the `cost` of `pack` / `select` / `reduce_tree`.
 
 `scripts/smoke.py` runs a complete example against the installed wheel.
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .errors import DoesNotFit
@@ -44,8 +44,19 @@ class CharEstimate:
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must not be negative")
 
+    def calibrated(self, text: str, tokens: int) -> CharEstimate:
+        """This estimate with its characters per token taken from one exact count the host made
+        of `text` (its vendor's `count_tokens`), so a long document is measured once, not per
+        piece: `split(doc, counter=CharEstimate().calibrated(doc, await count_tokens(doc)))`.
+        The other parameters are kept."""
+        if not text or not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
+            raise ValueError("calibrating needs a non-empty text and a positive token count")
+        return replace(self, chars_per_token=len(text) / tokens)
+
     def text(self, s: str) -> int:
-        return math.ceil(len(s) / self.chars_per_token)
+        # Rounded before ceil: a calibrated ratio (7 / 3) gives 7 / (7 / 3) = 3.0000000000000004,
+        # which must count as 3, not 4.
+        return math.ceil(round(len(s) / self.chars_per_token, 9))
 
     def opaque(self, part: Opaque) -> int:
         if part.kind == "image":

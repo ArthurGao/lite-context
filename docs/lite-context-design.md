@@ -172,13 +172,27 @@ Budget(limit: int, reserve_output: int)   # limit = the model's input window as 
 ```
 
 - 默认计数器是估算（字符数 / 3.5），与宿主 A 现在的做法一致；宿主 B 可以换成 tiktoken。厂商 SDK 的 count_tokens
-  是一次网络调用，不进核心（§15）。
+  是一次网络调用，不进核心（§15）。要精确时用**校准**（v0.3.2）：宿主对整篇文本做一次自己的精确计数，
+  `CharEstimate().calibrated(text, tokens)` 给出按这个比例算的估算（其它参数不变），交给 `split(counter=...)`、
+  `pack` / `select` / `reduce_tree` 的 `cost`——一篇文档一次网络调用，而不是每段一次；不另做一套 async 接口。
+  `text()` 先把商四舍五入到 9 位小数再向上取整：校准出来的比例（7 / 3）会让 7 / (7 / 3) 得到 3.0000000000000004，
+  必须算成 3（属性测试找到的）；默认的 3.5 下商都是 1/7 的倍数，结果不变。
 - `tokens` 不为 `None` 时直接用，计数器不被调用（`count_message` 里判断，每个 `Counter` 不用各自记得）。否则
   `CharEstimate.opaque()` 只看 `kind` 和中立度量，从不读 `raw`：`image` 1600；有 `pages` 时页数 × 2000；有 `text`
   时数文字；其它（`redacted_thinking`、读不出页数的 PDF、未知块）用默认值 1500。几个数都是构造参数。
   adapter 取度量：Anthropic 的 `thinking` 文本、文本来源的 `document`、base64 PDF（数 `/Type /Page`）；OpenAI 的
-  `file` 部分里 `data:application/pdf;base64,` 开头的 `file_data`。页数是数 `/Type /Page` 的估计：页对象放在压缩
-  对象流里（PDF 1.5 的 `ObjStm`）时数不到、落到默认值；增量更新过的文件可能多数。都只影响估算，不影响内容。
+  `file` 部分里 `data:application/pdf;base64,` 开头的 `file_data`。页数按这个顺序数（v0.3.2）：文件里看得见的
+  `/Type /Page`；没有时解压 FlateDecode 流（PDF 1.5 的 `ObjStm` 把页对象放在里面）再数，解压总量最多 64 MiB
+  （`MAX_INFLATED`，解压炸弹最多花这么多）、解不开的流跳过；还没有就取页树节点（`/Type /Pages`）里最大的 `/Count`
+  （大纲的 `/Count` 不算）；都没有才是 `None`、落到默认值。不按文件大小猜（规则 12）。增量更新过的文件可能多数。
+  都只影响估算，不影响内容。每一步对文件都是线性的：流按 `stream` 关键字找下一个 `endstream`（前面有没有换行都行），
+  `stream` 前面必须是分隔符（空白或 `>`），所以 `endstream`、`upstream` 不算开头。页树节点在 `/Type /Pages` 前后 4 KiB
+  里按嵌套找所在的字典，只读它自己这一层的 `/Count`（`/Resources << /Count 99 >>` 这类嵌套字典里的不算）；每次查找
+  从上一次停下的地方接着找，一个节点只扫一遍窗口；最多看 1000 个节点（9 MB 全是节点的文件 0.06 秒，不设上限 0.60 秒）。
+  局限（只影响估算）：页树字典超过 4 KiB（扁平的根节点挂了上千个 `/Kids`）、字符串里有 `>>` 时数不出，落到默认值；
+  有一页看得见、其余在压缩流里的增量更新文件按看得见的算（与 v0.3.1 相同）。
+  第一版用了两个正则，review 发现输入不大就是平方级（280 KB 要 68 秒）；第二版的字典查找每步重扫整个窗口，0.07 MB
+  的构造输入要 6 秒——都改掉了，构造的最坏输入现在都在 0.1 秒内。
 - `CharEstimate` 的参数必须为正（`chars_per_token`）或不为负（其它）；`fixed` 里的 token 数必须是非负的 int
   （`bool` 不算），否则 `ValueError`。
 - `TiktokenCounter` 推迟到 C4、宿主 B 接入时做：tiktoken 第一次用时从网络下载编码文件，和"测试不联网"冲突，需要
@@ -820,9 +834,10 @@ lite-context/
   是同步的；要不要加一个 async 计数器，或让宿主先算好再传 `Opaque.tokens` / 预算，C4 接入时定。
   C4 结论（宿主 B）：chat 用估算够用；文档的切分 / 对半 / 分层 reduce 因此没换，`split` / `halving` /
   `reduce_tree` 的 cost 若能是 async（或接受预先算好的数），宿主 B 才能换过来。
-- **数不出页数的 PDF**（C4 宿主 B）：PDF 1.5 以后常把页对象放进压缩的 object stream，`pdf_pages` 找不到页，
-  按 `opaque_default`（1,500）计，会低估大文件。可以退到按字节数估。目前宿主 B 的客户端自己还会再检查一次，
-  所以不是回归。
+  v0.3.2 结论：用校准，不做 async 计数器（§4）——宿主 B 自己的文档工具本来就是"整篇数一次、算出比例"，换过来时
+  照这个做（宿主 B 暂缓，owner 决定）。
+- ~~**数不出页数的 PDF**~~（C4 宿主 B）：v0.3.2 解决——压缩对象流解压后再数、再看页树的 `/Count`（§4）；没有按字节数
+  猜。
 - **报告的汇总**：两个宿主都自己按 `Action.what` 数了"mask 了几个 / 丢了几条"。若第三个宿主也要，`Report` 加一个
   汇总方法。
 - **摘要质量怎么测**：masking 和摘要哪个更好，公开结果是 reported。C4 之后用 lite-eval 在宿主的真实任务上对比，

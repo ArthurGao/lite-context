@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C6 完成（2026-11-26，v0.3.0 待发布）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 

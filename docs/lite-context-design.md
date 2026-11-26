@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C5 完成（2026-11-26，v0.2.0 待发布）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -375,20 +375,40 @@ Anthropic 会把它们合并，OpenAI 接受；要求严格交替的后端（有
 ## 8. `Transcript`：给没有存储的宿主
 
 ```python
-t = Transcript(store=InMemoryStore(), id="thread-1")      # or PgStore (extra `pg`)
-seq = t.append([user("...")], expected_seq=t.last_seq)
-fitted = t.project(budget=..., steps=[...])              # latest ContextState + fit()
-reply = my_llm.call(fitted.messages)
-t.append([assistant_from(reply), fitted.state], expected_seq=seq)   # the state is an entry too
-await t.compact(summarize=fn)                            # writes a new ContextState entry when due
+store = PgStore(url)                                       # or InMemoryStore() (extra `pg` for PgStore)
+t = Transcript(store, "thread-1")
+await t.create()                                           # creating again does nothing
+seq = await t.append([user_message], expected_seq=await t.last_seq())
+fitted = await t.project(budget=..., steps=[...])          # fit() over the messages + the latest state
+reply = await my_llm.call(fitted.messages)
+seq = await t.append([assistant_message, fitted.state], expected_seq=seq)   # the state is an entry too
+await t.compact(summarize=fn)                              # acompact() + appends the new state; None when nothing is due
 ```
 
-- append-only：条目是 `Message` 或 `ContextState`，带单调递增的 `seq`（就是 `key`）；`append(entries, expected_seq)`
-  并发冲突时一个成功一个被拒（`SeqConflict`），一批条目全有或全无。
-- `project()` 是纯投影：同一份条目得到同一份输出。
-- PostgreSQL：数据库和 role `lite_context`，schema `lite_context`；测试只用同一数据库里的 schema
-  `lite_context_test`，URL 来自 `LITECONTEXT_TEST_DATABASE_URL`。表上有拒绝 UPDATE / DELETE 的 trigger（与
-  lite-agent 的 events 表一样）。
+- **异步**（C5 定）：store 和 `Transcript` 的方法都是 `async`。可能的调用方都是异步的（C6 的 FastAPI 壳、异步宿主、
+  lite-agent），和 lite-agent 的 `SessionStore` 一致。`project()` 本身仍是纯函数，只是要先读 store。
+- append-only：条目是 `Message` 或 `ContextState`，带每个 transcript 内从 1 起单调递增的 `seq`。**消息的 key 就是
+  它的 seq**（`"1"`、`"2"`…），由 `Transcript` 分配；带着 key 的消息被拒（`ValueError`），不悄悄覆盖。这样已存的
+  `ContextState` 里的切点永远指向同一条消息。
+- `append(items, expected_seq)`：`expected_seq` 不是当前尾部时抛 `SeqConflict`，什么都不写；一批条目全有或全无；
+  批里的 seq 必须接在尾部后面。并发时一个成功、其余被拒（PG 里靠对 transcript 行 `FOR UPDATE`）。
+- `project()` 是纯投影：所有消息按 seq 排好，加上最新一条 `ContextState`（没有时为 `None`），交给 `fit()`。同一份
+  条目得到同一份输出；`fitted.state` 变了由调用方 append 回去。
+- `compact()`：对同样的消息和最新状态跑 `acompact()`，把新状态 append 上去，返回它的 seq；写摘要期间有人 append
+  了就是 `SeqConflict`（重跑即可）。
+- store 存的是 JSON 记录：消息用 `lite_context.codec`（`message_to_dict` / `message_from_dict`，带版本号，保留每个
+  部件的每个字段），状态用 `ContextState.to_json`。写入时按读回时的标准检查：JSON 还原不出相等值的内容（tuple、
+  非字符串的 key、NaN、对象）、类型不对的字段（`pinned=1`、`tokens=True`、tool result 里套 tool result）、任何地方的
+  NUL 字符和孤立的 surrogate（PostgreSQL 存不了）都在写入时被拒——transcript 只能追加，写进去读不回来就永远坏了。
+  内存和 PG 两种 store 因此行为一样。
+- PostgreSQL（extra `pg`，psycopg 3.3.8，与 lite-agent 同一个版本）：数据库和 role `lite_context`，schema
+  `lite_context`；只接受 `lite_context` 或 `lite_context_<名字>` 这样的 schema。测试只用同一数据库里的 schema
+  `lite_context_test`，URL 来自 `LITECONTEXT_TEST_DATABASE_URL`，没设时测试失败而不是跳过。表 `transcripts`、
+  `entries`；`entries.data` 是 `json` 而不是 `jsonb`（jsonb 会重排对象的 key，adapter 原样还给厂商的块就变了字节，
+  prompt cache 的前缀会断）；`entries` 上有拒绝 UPDATE / DELETE / TRUNCATE 的 trigger（与 lite-agent 的 events 表
+  一样）。数据库的任何失败都以 `StoreError` 出来（只带异常类型和 SQLSTATE）；第一次连接失败后下次调用重新连接。
+  迁移是包里的 `NNNN_*.sql`，`litecontext migrate` / `litecontext pending`（URL 来自 `LITECONTEXT_DATABASE_URL`）。
+  连接错误只显示异常类型和去掉密码的 URL。
 
 ## 9. REST 壳
 
@@ -729,6 +749,24 @@ lite-context/
      请求，改成用满额度。
   3. `DoesNotFit` 有两种原因：保留的轮次装不下，或者 fixed 本身就超了。给用户的消息要分开说，不能都说
      "最新一条太大"。
+
+- **C5（2026-11-26）**：`Transcript`（异步）、`InMemoryStore`、`PgStore`（extra `pg`）、消息的 JSON codec、
+  `litecontext migrate` / `pending`，版本 0.2.0。验收：store 的同一组契约测试在内存和 PG 上都跑（顺序读回、
+  `expected_seq` 不对时什么都不写、批的 seq 必须接上、未知 transcript、8 个并发 append 恰好一个成功）；PG 上
+  UPDATE / DELETE / TRUNCATE 被 trigger 拒绝；同一段会增长、会 mask、会写一次摘要的脚本对话，内存和 PG 每一步的
+  投影逐字节相同；另一个进程（`python -I`）从 PG 读回后投影相同。核心仍不加载任何第三方模块（干净的 3.11 venv
+  里装 wheel，smoke 通过，`psycopg` 没被导入）。
+  变异检查发现两处测试没咬住，已补：去掉 PG 的 `FOR UPDATE` 时并发测试仍通过（测试 store 的连接池起始只有 1 个连接，
+  并发 append 其实是排队的；改成起始 4 个连接后，去掉锁会出 `UniqueViolation`、测试失败）；投影用第一条而不是最新一条
+  状态时测试仍通过（只存过一条状态；补了先存 mask 状态再摘要的用例）。
+  收尾：`/simplify` 四个角度 + review（Codex 额度用完到 2026-12-18，用 Claude 子代理代替）。review 发现并修掉（都先写了
+  失败的测试）：codec 写入时不检查读回时检查的类型，`pinned=1` 一类的消息能写进去、之后整个 transcript 读不出来；
+  NUL / 孤立 surrogate 内存 store 收、PG 报 psycopg 原始异常；第一次连接失败后 store 永久不可用（关掉的连接池不能
+  再开）；连上以后的数据库错误不是 `StoreError`；jsonb 重排 key。simplify 采纳：存储层独立成 `store.py`（pg 不再
+  经 transcript 导入 fit）、`check_batch` 同时检查尾部、schema 检查移进 `migrate` / `pending`、状态的编码移进 codec、
+  codec 的允许值从 `types` 的 Literal 取、测试共用一个 `keyless_turn` 和 `fresh_schema`、网络守卫只在要了 `pg_url`
+  的测试里放行数据库主机。没采纳：大 PDF 每次 append 被序列化约 3 次、`project()` 每次读整个日志（现在没有宿主
+  在 transcript 里存大文件；以后用类型遍历代替 dumps/loads、按 `after` 增量读）。
 
 ## 15. 待确认
 

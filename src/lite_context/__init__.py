@@ -8,14 +8,19 @@ from .errors import (
     EmptySummary,
     LiteContextError,
     ProtectedChange,
+    SeqConflict,
     StaleState,
+    StoreError,
     TruncatedSummary,
+    UnknownTranscript,
     UnreportedChange,
     UnsupportedInput,
 )
 from .fit import Fitted, fit
 from .report import Action, Report
 from .state import Compaction, ContextState, Cut
+from .store import InMemoryStore, Store
+from .transcript import Entry, Transcript
 from .types import (
     ContentForm,
     Message,
@@ -42,7 +47,9 @@ __all__ = [
     "Cut",
     "DoesNotFit",
     "EmptySummary",
+    "Entry",
     "Fitted",
+    "InMemoryStore",
     "LiteContextError",
     "Message",
     "Opaque",
@@ -51,13 +58,18 @@ __all__ = [
     "ProtectedChange",
     "Report",
     "Role",
+    "SeqConflict",
     "StaleState",
+    "Store",
+    "StoreError",
     "Summary",
     "SummaryPolicy",
     "Text",
     "ToolCall",
     "ToolResult",
+    "Transcript",
     "TruncatedSummary",
+    "UnknownTranscript",
     "UnreportedChange",
     "UnsupportedInput",
     "acompact",

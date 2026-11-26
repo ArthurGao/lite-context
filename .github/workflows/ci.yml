@@ -18,12 +18,25 @@ jobs:
       matrix:
         # 3.11 is the floor (design §0): the first hosts include one on 3.11.
         python: ["3.11", "3.12"]
+    services:
+      postgres:
+        # The image lite-agent and lite-cache pin (pgvector is not needed: one pin, not two).
+        image: pgvector/pgvector:0.8.6-pg18
+        env:
+          # No password: the container lives only for this job and listens only on the runner.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: lite_context
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 1s --health-timeout 5s --health-retries 30
+    env:
+      LITECONTEXT_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/lite_context
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2   # v10.3.3
         with:
           version: "0.10.8"
-      - run: uv sync --locked --python ${{ matrix.python }}
+      - run: uv sync --locked --all-extras --python ${{ matrix.python }}
       - run: uv run ruff check && uv run ruff format --check
       - run: uv run mypy --python-version ${{ matrix.python }}
       - run: uv run pytest

@@ -1,6 +1,6 @@
 # lite-context
 
-**v0.1.0** (2026-11-26; stage plan: design §14).
+**v0.2.0** (2026-11-26; stage plan: design §14).
 
 lite-context decides **what the model should see in this call**. Give it your full history (or a set of
 documents or retrieved chunks) and a token budget. It returns what to send this time and a report of what it
@@ -18,6 +18,8 @@ LLM layer.
   a small adapter.
 - **No model calls inside.** Summaries and map-reduce merges call a function you pass in, so the model call stays
   in your own role layer. The core is pure and has no dependencies, so it also runs inside a Temporal workflow.
+- **No storage of your own?** `Transcript` keeps an append-only log of messages and states, in memory or in
+  PostgreSQL (extra `pg`), and projects it through `fit()`.
 - **Long documents:** split with overlap and section headings, pack pages into budget-sized groups, halve a batch
   a model refuses as too large, merge notes level by level, pick retrieved chunks within a budget.
 
@@ -26,8 +28,9 @@ LLM layer.
 From the GitHub Release (lite-context is not on PyPI). Python 3.11 or 3.12, no dependencies:
 
 ```
-uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.1.0/lite_context-0.1.0-py3-none-any.whl"
-pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.1.0/lite_context-0.1.0-py3-none-any.whl"
+uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"
+pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"
+pip install "lite-context[pg] @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"   # PgStore
 ```
 
 ## Example
@@ -70,6 +73,21 @@ pieces = split(text, max_tokens=80_000, heading=re.compile(r"^(SECTION|PART)\b.*
 groups = pack(pages, budget=100_000, cost=lambda p: estimate(p.text))
 notes = await halving(lines, read_part, too_large=lambda e: getattr(e, "oversized", False))
 merged = await reduce_tree(notes.results, budget=24_000, cost=estimate, merge=merge_notes)
+```
+
+A transcript, for a host with no history store (PostgreSQL: `litecontext migrate` once, URL in
+`LITECONTEXT_DATABASE_URL`):
+
+```python
+from lite_context import Budget, InMemoryStore, Transcript
+from lite_context.pg import PgStore            # extra `pg`
+
+t = Transcript(PgStore(url), "thread-1")       # or InMemoryStore()
+await t.create()
+seq = await t.append([question], expected_seq=await t.last_seq())   # SeqConflict if someone was first
+fitted = await t.project(budget=Budget(200_000, 8_000), steps=steps)
+reply = my_llm.chat(messages=anthropic.from_messages(fitted.messages))
+await t.append([answer, fitted.state], expected_seq=seq)            # the state is an entry too
 ```
 
 `scripts/smoke.py` runs a complete example against the installed wheel.

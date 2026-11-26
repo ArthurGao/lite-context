@@ -1,6 +1,6 @@
 [project]
 name = "lite-context"
-version = "0.1.2"
+version = "0.2.0"
 description = "Context management for LLM calls: what each call should see"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -9,6 +9,14 @@ license-files = ["LICENSE"]
 # The core has no run-time dependencies (AGENTS.md rule 6). Extras arrive with their stages
 # (design §14): lite-model (adapter), pg (C5), server (C6).
 dependencies = []
+
+[project.scripts]
+litecontext = "lite_context.cli:main"
+
+[project.optional-dependencies]
+pg = [
+    "psycopg[binary,pool]==3.3.8",
+]
 
 [dependency-groups]
 dev = [

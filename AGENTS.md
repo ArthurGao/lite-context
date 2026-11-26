@@ -32,8 +32,9 @@ the Anthropic and OpenAI adapters (lossless round trip), counting and budgets (d
 long documents — `split`, `pack`, `halving`, `reduce_tree`, `select` (design §7). **C3 done 2026-11-26: v0.1.0
 released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a uv 3.12 project); v0.1.1 (`py.typed`),
 v0.1.2 (reused call ids). **C4 2026-11-26: host A adopted it** in its own repository; host B was trialled and reverted, deferred
-by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). Next: C5 —
-`Transcript` and stores, unless the owner resumes host B first.
+by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). **C5 done
+2026-11-26**: `Transcript` (async), `InMemoryStore`, `PgStore` (extra `pg`), the message codec, `litecontext
+migrate` / `pending` (design §8); version 0.2.0, not yet released. Next: C6 — the REST shell.
 
 ## Rules
 
@@ -76,13 +77,12 @@ Extras: `lite-model`, `tiktoken`, `pg` (psycopg 3), `server` (FastAPI), `eval`.
 ## Commands
 
 ```
-uv run pytest                    # C0-C4 (about 7 s: tests/test_growth.py runs 150 random histories); from C5 with --env-file .env
-uv run --python 3.11 --isolated --with-editable . --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
-uv run --env-file .env pytest    # everything; PostgreSQL tests need LITECONTEXT_TEST_DATABASE_URL (from C5)
+uv run --env-file .env pytest    # every test; the PostgreSQL ones (C5) need LITECONTEXT_TEST_DATABASE_URL from .env and fail without it
+uv run --env-file .env --python 3.11 --isolated --with-editable '.[pg]' --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv build --out-dir dist && uv venv --python 3.11 /tmp/c && uv pip install --python /tmp/c dist/*.whl && (cd /tmp && /tmp/c/bin/python -I $OLDPWD/scripts/smoke.py)   # the wheel alone
 uv run litecontext serve          # the REST shell, loopback :8750 (extra `server`, from C6)
-uv run litecontext migrate        # the Transcript tables (extra `pg`, from C5)
+uv run --env-file .env litecontext migrate   # the Transcript tables (extra `pg`); `pending` lists what is not applied
 ```
 
 ## Workflow

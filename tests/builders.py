@@ -4,7 +4,7 @@ message costs nothing extra, so expected numbers can be read off the text."""
 from lite_context import Message, Opaque, Text, ToolCall, ToolResult
 from lite_context.testing import COUNTER
 
-__all__ = ["COUNTER", "calls", "human", "image", "results", "say", "thinking_call"]
+__all__ = ["COUNTER", "calls", "human", "image", "keyless_turn", "results", "say", "thinking_call"]
 
 
 def human(key: str, text: str, *, pinned: bool = False) -> Message:
@@ -45,3 +45,14 @@ def thinking_call(key: str, call_id: str, thought: str) -> Message:
         ),
         key=key,
     )
+
+
+def keyless_turn(t: int, *, size: int = 400) -> list[Message]:
+    """A question, a tool call, its result of `size` characters and an answer, without keys: a
+    `Transcript` gives each message its seq as key."""
+    return [
+        Message("user", (Text(f"question {t}"),)),
+        Message("assistant", (ToolCall(f"c{t}", "search", f'{{"q": {t}}}'),)),
+        Message("user", (ToolResult(f"c{t}", (Text("r" * size),)),)),
+        Message("assistant", (Text(f"answer {t}"),)),
+    ]

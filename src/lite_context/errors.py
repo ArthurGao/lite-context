@@ -44,3 +44,24 @@ class EmptySummary(LiteContextError):
 
 class TruncatedSummary(LiteContextError):
     """The summary was cut off by the output limit: half a summary cannot stand for the history."""
+
+
+class SeqConflict(LiteContextError):
+    """A `Transcript` append whose `expected_seq` is not the transcript's tail: someone else
+    appended first (design §8). Nothing was written; read again and retry."""
+
+    def __init__(self, transcript: str, expected: int, actual: int) -> None:
+        super().__init__(
+            f"transcript {transcript!r}: expected seq {expected}, the tail is {actual}"
+        )
+        self.expected = expected
+        self.actual = actual
+
+
+class UnknownTranscript(LiteContextError):
+    """A transcript id the store has never created (design §8)."""
+
+
+class StoreError(LiteContextError):
+    """The store could not do what was asked (a connection, a missing migration); never a
+    conflict or an unknown transcript, which have their own errors."""

@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：v0.3.1 已发布（2026-11-26）：公开 `render_transcript`，给 lite-agent（C7）用；C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C0–C7 完成（2026-11-26）：lite-agent v0.2.5 的压缩器用上了 lite-context（C7）；v0.3.1 已发布：公开 `render_transcript`；C6 完成，v0.3.0 已发布（2026-11-26，GitHub Release wheel）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -805,6 +805,14 @@ lite-context/
   修完再 review 一轮：没有新 bug；两处小问题已修——带 NUL 的 transcript id 在 PG 上是 503（现在 `Transcript` 自己按和
   codec 一样的规则检查 id，1–200 字符，所有 store 都 422）；请求体上限的报错提到一个不存在的 `--max_body` 参数。
   接受的取舍：库里的 `ValueError` 都按 422 返回，库自身的 bug 若以 `ValueError` 出现也会是 422 而不是 500。
+
+- **C7（2026-11-26）**：lite-agent v0.2.5 的压缩器改用 lite-context 0.3.1（在 lite-agent 仓库里做，owner 决定：lite-context 是它的
+  核心依赖、范围只到压缩）。提问（`ASK` / `END`）、摘要外框（`SUMMARY`）、transcript 渲染（新公开的 `render_transcript`）
+  来自这里；lite-agent 自己保留切点（按 `model_turn`、在事件 seq 上，`plan_compaction` 按人的轮次、在带 key 的消息上，不适用）
+  和去掉抄回头标的规则（任何十六进制头标）。所以 C7 行里说的"它提供自己的 `SummaryPolicy`"最后不需要：它不调
+  `plan_compaction` / `accept`，只用渲染和外框。验收：lite-agent 的 38 个已有测试文件 sha256 前后相同、503 个测试一行没改全部通过；
+  用 v0.2.4 代码生成的金标准逐字节相同；review 用 2 万段随机历史对比新旧实现，loop 可达的路径上没有差别。fit() / masking
+  没有接进 lite-agent（owner 选的范围）。C0–C7 全部完成。
 
 ## 15. 待确认
 

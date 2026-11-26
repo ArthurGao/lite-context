@@ -61,6 +61,9 @@ def to_messages(native: Sequence[object]) -> Converted:
         if role in _SYSTEM_ROLES:
             if messages:
                 raise UnsupportedInput(f"{where}: a {role} message after the conversation started")
+            if not isinstance(msg.get("content"), str | list):
+                # it counts toward the budget: content that is not text would count as nothing
+                raise UnsupportedInput(f"{where}: a {role} message's content must be text or parts")
             fixed.append(msg)
         elif role == "user":
             parts, form = _required_content(msg, where)

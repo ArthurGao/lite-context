@@ -271,3 +271,11 @@ def test_a_tool_call_that_is_not_a_function_call_is_refused(bad: dict[str, Any])
 def test_the_sdk_shape_with_tool_calls_none_survives() -> None:
     native = [{"role": "assistant", "content": "hi", "refusal": None, "tool_calls": None}]
     assert roundtrip(native) == native
+
+
+@pytest.mark.parametrize("content", [5, None, {"text": "x"}])
+def test_a_system_message_whose_content_is_not_text_is_refused(content: object) -> None:
+    with pytest.raises(UnsupportedInput, match="content"):
+        openai.to_messages(
+            [{"role": "system", "content": content}, {"role": "user", "content": "hi"}]
+        )

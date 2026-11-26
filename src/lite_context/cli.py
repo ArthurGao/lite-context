@@ -1,5 +1,6 @@
-"""`litecontext`: the command line (design §8). No logic: it parses, calls the library and
-prints. `migrate` and `pending` need the extra `pg`; the URL comes from LITECONTEXT_DATABASE_URL."""
+"""`litecontext`: the command line (design §8, §9). No logic: it parses, calls the library and
+prints. `migrate` and `pending` need the extra `pg` (URL from LITECONTEXT_DATABASE_URL); `serve`
+the extra `server` (LITECONTEXT_HOST, LITECONTEXT_PORT, LITECONTEXT_MAX_BODY, design §10)."""
 
 from __future__ import annotations
 
@@ -20,8 +21,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--schema", default="lite_context")
+    serve = commands.add_parser("serve", help="the REST shell, loopback only (design §9)")
+    serve.add_argument("--host", default=None, help="default LITECONTEXT_HOST, else 127.0.0.1")
+    serve.add_argument("--port", default=None, help="default LITECONTEXT_PORT, else 8750")
     args = parser.parse_args(argv)
+    if args.command == "serve":
+        return _serve(args.host, args.port)
     return _database(args.command, args.schema)
+
+
+def _setting(value: str | None, name: str, default: int, *, top: int | None = None) -> int:
+    """A positive whole number from the command line or LITECONTEXT_<name>; ValueError naming
+    the setting otherwise."""
+    raw = value if value is not None else os.environ.get(f"LITECONTEXT_{name}", str(default))
+    try:
+        number = int(raw)
+    except ValueError:
+        number = 0
+    if number < 1 or (top is not None and number > top):
+        limit = f"1 to {top}" if top else "a positive whole number"
+        flag = f" (or --{name.lower()})" if name == "PORT" else ""
+        raise ValueError(f"LITECONTEXT_{name}{flag} must be {limit}, not {raw!r}")
+    return number
+
+
+def _serve(host_arg: str | None, port_arg: str | None) -> int:
+    try:
+        import uvicorn
+
+        from .server import check_host, create_app
+        from .server.app import DEFAULT_MAX_BODY
+    except ImportError:
+        return _fail("serve needs the extra: pip install 'lite-context[server]'", 2)
+    host = host_arg or os.environ.get("LITECONTEXT_HOST", "127.0.0.1")
+    try:
+        check_host(host)
+        port = _setting(port_arg, "PORT", 8750, top=65535)
+        max_body = _setting(None, "MAX_BODY", DEFAULT_MAX_BODY)
+    except ValueError as exc:
+        return _fail(str(exc), 2)
+    uvicorn.run(create_app(max_body=max_body), host=host, port=port)
+    return 0
 
 
 def _database(command: str, schema: str) -> int:

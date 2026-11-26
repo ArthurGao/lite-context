@@ -28,7 +28,8 @@ Kind = Literal["message", "state"]
 _ROLES = get_args(Role)
 _KINDS = get_args(OpaqueKind)
 _FORMS = (None, *get_args(ContentForm))
-_UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
+# What PostgreSQL cannot store, so no store takes it (the transcript ids too).
+UNSTORABLE = re.compile("[\x00\ud800-\udfff]")
 
 
 def message_to_dict(m: Message) -> dict[str, object]:
@@ -47,6 +48,8 @@ def message_to_dict(m: Message) -> dict[str, object]:
 
 
 def message_from_dict(data: Mapping[str, Any]) -> Message:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"not a message record: expected an object, got {type(data).__name__}")
     if data.get("v") != VERSION:
         raise ValueError(f"unknown message record version {data.get('v')!r}")
     try:
@@ -71,6 +74,8 @@ def item_to_record(item: Message | ContextState) -> tuple[Kind, dict[str, Any]]:
 
 def record_to_item(kind: str, data: Mapping[str, Any]) -> Message | ContextState:
     if kind == "state":
+        if not isinstance(data, Mapping):
+            raise ValueError(f"not a state: expected an object, got {type(data).__name__}")
         return ContextState.from_json(json.dumps(data))
     if kind == "message":
         return message_from_dict(data)
@@ -151,7 +156,7 @@ def _json(value: Any, what: str) -> Any:
 def _storable(value: Any) -> None:
     """Every string in `value`, keys included, free of NUL and lone surrogates."""
     if isinstance(value, str):
-        if _UNSTORABLE.search(value):
+        if UNSTORABLE.search(value):
             raise ValueError("a NUL character or a lone surrogate cannot be stored")
     elif isinstance(value, dict):
         for k, v in value.items():

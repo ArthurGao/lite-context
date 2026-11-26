@@ -9,6 +9,18 @@ from lite_context.pg.db import migration_files
 ALL = ", ".join(v for v, _ in migration_files())
 
 
+@pytest.fixture(autouse=True)
+def _never_a_real_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`serve` must never start uvicorn from a test, not even when a check under test is broken:
+    the tests that expect it to run replace this stub with their own."""
+    import uvicorn
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a test started a real server")
+
+    monkeypatch.setattr(uvicorn, "run", refuse)
+
+
 def test_migrate_applies_then_says_up_to_date(
     pg_url: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -47,3 +59,67 @@ def test_a_schema_not_our_own_is_refused(
     monkeypatch.setenv("LITECONTEXT_DATABASE_URL", "postgresql://u@127.0.0.1:1/x")
     assert main(["migrate", "--schema", "public"]) == 2
     assert "schema must be lite_context" in capsys.readouterr().err
+
+
+def test_serve_refuses_an_address_that_is_not_loopback(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["serve", "--host", "0.0.0.0"]) == 2
+    assert "loopback only" in capsys.readouterr().err
+
+
+def test_serve_runs_the_app_on_the_given_loopback_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uvicorn
+
+    seen: dict[str, object] = {}
+
+    def fake_run(app: object, *, host: str, port: int) -> None:
+        seen.update(app=app, host=host, port=port)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.delenv("LITECONTEXT_DATABASE_URL", raising=False)
+    monkeypatch.setenv("LITECONTEXT_MAX_BODY", "1000")
+    assert main(["serve", "--port", "8799"]) == 0
+    assert (seen["host"], seen["port"]) == ("127.0.0.1", 8799)
+    assert getattr(seen["app"], "limit", None) == 1000
+
+
+def test_serve_reads_host_and_port_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    import uvicorn
+
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        uvicorn, "run", lambda app, *, host, port: seen.update(host=host, port=port)
+    )
+    monkeypatch.setenv("LITECONTEXT_HOST", "::1")
+    monkeypatch.setenv("LITECONTEXT_PORT", "8751")
+    assert main(["serve"]) == 0
+    assert seen == {"host": "::1", "port": 8751}
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("LITECONTEXT_PORT", "abc"),
+        ("LITECONTEXT_PORT", "0"),
+        ("LITECONTEXT_MAX_BODY", "1MB"),
+        ("LITECONTEXT_MAX_BODY", "0"),
+    ],
+)
+def test_a_bad_setting_for_serve_is_named_not_a_traceback(
+    name: str, value: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv(name, value)
+    assert main(["serve"]) == 2
+    err = capsys.readouterr().err
+    assert name in err
+    assert "--max_body" not in err and "--max-body" not in err  # there is no such flag
+
+
+def test_a_bad_port_setting_does_not_stop_the_other_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("LITECONTEXT_PORT", "abc")
+    monkeypatch.delenv("LITECONTEXT_DATABASE_URL", raising=False)
+    assert main(["pending"]) == 2
+    assert "LITECONTEXT_DATABASE_URL is not set" in capsys.readouterr().err

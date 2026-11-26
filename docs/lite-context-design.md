@@ -1,6 +1,6 @@
 # lite-context 设计文档
 
-**状态：C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
+**状态：C6 完成（2026-11-26，v0.3.0 待发布）：REST 壳 `litecontext serve`（extra `server`）；C5 完成，v0.2.0 已发布（2026-11-26，GitHub Release wheel）：`Transcript`、`InMemoryStore`、`PgStore`、`litecontext migrate`；C4 宿主 A 已接入，宿主 B 试接入后撤回、暂缓（2026-11-26）；v0.1.2（被后一批复用的 call id 不再让新结果被 mask）；v0.1.1（wheel 带 `py.typed`）；v0.1.0 已发布（C3，2026-11-26，GitHub Release wheel）。C2 完成：长文档工具（`split` / `pack` / `halving` / `reduce_tree` / `select`）；C1 完成：C1b 摘要（`plan_compaction` / `accept` / `acompact`、`SummaryPolicy`、`fit()` 应用摘要）；C1a `fit()`、四个步骤、`ContextState` 与切点、运行时检查；C0 完成：中立类型、Anthropic / OpenAI adapter、计数与预算。仓库 github.com/ArthurGao/lite-context。第一批宿主：两个自带
 LLM 层的 Python 项目（下称宿主 A、宿主 B，§12），在 C4 同时接入。**
 与代码冲突时，在同一次改动里更新本文，并在 commit 里说明原因。
 
@@ -412,22 +412,42 @@ await t.compact(summarize=fn)                              # acompact() + append
 
 ## 9. REST 壳
 
-`litecontext serve`（extra `server`，FastAPI），只绑 127.0.0.1:8750，拒绝别的地址；不做鉴权，与 lite-agent 的
-HTTP 壳一样，等有宿主要从别的机器访问时再定。壳里没有逻辑：解析请求、调库、序列化。
+`litecontext serve`（extra `server`，FastAPI 0.162.2 + uvicorn 0.54.0，与 lite-agent 同版本），只绑回环地址
+（默认 127.0.0.1:8750；`0.0.0.0`、局域网地址、连 `localhost` 这个名字都拒绝），不做鉴权，与 lite-agent 的 HTTP 壳一样，
+等有宿主要从别的机器访问时再定。Host 不是回环名字 400、带外来 Origin 403、POST 不是 JSON 415（这三条和 `check_host`
+从 lite-agent 抄来）；请求体超过 `LITECONTEXT_MAX_BODY`（默认 32 MiB）413——声明的长度超了直接拒，没声明的边读边数。
+壳里没有逻辑：`schemas` 解析（未知字段 422）、`wire` 转换、`app` 调一次库再序列化，同样的输入得到库给的结果。
 
-| 端点 | 状态 | 对应 |
+| 端点 | 状态 | 对应 / 返回 |
 | --- | --- | --- |
-| `POST /v1/fit` | 无状态 | `fit()`；`format: anthropic \| openai \| neutral` 决定 messages 的格式 |
-| `POST /v1/compaction/plan` / `POST /v1/compaction/accept` | 无状态 | §6.1 的前后两步：返回写摘要的 prompt；交回摘要文本，返回 `Compaction` |
-| `POST /v1/docs/split`、`/v1/docs/pack`、`/v1/docs/select` | 无状态 | §7 里不调模型的三个 |
-| `POST /v1/transcripts`、`POST /v1/transcripts/{id}/entries`、`POST /v1/transcripts/{id}/project` | 有状态（需要 `pg`） | §8 |
-| `POST /v1/transcripts/{id}/compaction/plan` / `.../compaction/accept` | 有状态 | §8 的 `compact()` 拆成两步：服务返回 prompt，客户端写好摘要交回，服务追加新的 `ContextState` 条目 |
+| `POST /v1/fit` | 无状态 | `fit()` → `{messages, state, report}` |
+| `POST /v1/compaction/plan` | 无状态 | `plan_compaction` → `{system, prompt, covered, mark, keep_last_turns}` 或 `null` |
+| `POST /v1/compaction/accept` | 无状态 | 把 plan 原样交回并加上 `reply`（`truncated`、`provenance`、`now` 可选）→ `{state}` |
+| `POST /v1/docs/split` | 无状态 | `split` → `{pieces: [{start, end, text, heading}]}`；`heading` 是正则（≤200 字符，按行匹配） |
+| `POST /v1/docs/pack`、`/v1/docs/select` | 无状态 | 单元 `{text?, tokens?, key?}`，返回下标：`{groups}` / `{chosen, duplicates, over_budget}` |
+| `POST /v1/transcripts` | 有状态 | `{id}` → `{id, last_seq}`（再建一次无害） |
+| `POST /v1/transcripts/{id}/entries` | 有状态 | `{format, items: [{message} \| {state}], expected_seq}` → `{last_seq}` |
+| `GET /v1/transcripts/{id}/entries?after=&format=` | 有状态 | `{entries: [{seq, kind, item}]}`；OpenAI 格式下消息的 `item` 是一组 chat 消息 |
+| `POST /v1/transcripts/{id}/project` | 有状态 | `Transcript.project` → 与 `/v1/fit` 同形 |
+| `POST /v1/transcripts/{id}/compaction/plan` / `.../accept` | 有状态 | `Transcript.plan_compaction` → plan 加 `expected_seq`；accept 把状态追加在那个 seq 后 → `{last_seq}` |
 
-`halving` / `reduce_tree` 需要回调，不在 REST 里。服务端自己调 role 写摘要（需要 lite-model 和凭证）是以后的选项（§15）。
+- 消息带 `format: anthropic | openai | neutral`，返回同一种格式；neutral 是 `codec` 的记录。OpenAI 开头的
+  system / developer 消息算作 fixed，原样放回最前面；它不能存进 transcript（422，要作为 fixed 文本传）。
+  摘要需要每条消息都有 key：Anthropic / OpenAI 格式用可选的 `keys`。
+- 步骤：`[{"step": "truncate_tool_results", "max_tokens": N} | {"step": "mask_tool_results", "keep_last": N} |
+  {"step": "mask_opaque", "keep_last": N} | {"step": "drop_oldest", "keep_last_turns": N}]`。计数器固定是
+  `CharEstimate`。
+- 错误：`{error, detail}`，`error` 是异常名的 snake case。`DoesNotFit` 422 并带 `report`；`UnsupportedInput`、
+  `BrokenPairing`、摘要为空或被截断、库拒绝的输入 422；`StaleState`、`SeqConflict` 409（后者带 `expected`、
+  `actual`）；`UnknownTranscript` 404；`StoreError` 503；没有数据库时 transcript 端点 503。
+- transcript 用 `PgStore`（`LITECONTEXT_DATABASE_URL`，启动后第一次用时连接，关闭时断开）；测试可以注入
+  `InMemoryStore`。`halving` / `reduce_tree` 需要回调，不在 REST 里。服务端自己调 role 写摘要（需要 lite-model 和
+  凭证）是以后的选项（§15）。
 
 ## 10. 配置
 
-库的参数都在代码里传。REST 壳的配置来自环境变量，前缀 `LITECONTEXT_`（`DATABASE_URL`、`HOST`、`PORT`）；
+库的参数都在代码里传。REST 壳的配置来自环境变量，前缀 `LITECONTEXT_`（`DATABASE_URL`、`HOST`、`PORT`、
+`MAX_BODY`）；
 `.env.example` 是模板，`.env` 不进 git。
 
 ## 11. 测试
@@ -767,6 +787,24 @@ lite-context/
   codec 的允许值从 `types` 的 Literal 取、测试共用一个 `keyless_turn` 和 `fresh_schema`、网络守卫只在要了 `pg_url`
   的测试里放行数据库主机。没采纳：大 PDF 每次 append 被序列化约 3 次、`project()` 每次读整个日志（现在没有宿主
   在 transcript 里存大文件；以后用类型遍历代替 dumps/loads、按 `after` 增量读）。
+
+- **C6（2026-11-26）**：REST 壳 `litecontext serve`（extra `server`，§9），版本 0.3.0。库里为它加了两个函数：
+  `Transcript.plan_compaction()`（摘要的 plan 和当时的尾部 seq，`compact()` 也改用它）和
+  `compaction.accept_summary()`（从 plan 的几个部分接受摘要，`CompactionPlan.accept` 委托给它），这样壳里没有摘要
+  逻辑。验收：每个端点与库在同一输入上的输出逐字段相同（三种格式的 fit、摘要 plan / accept、split / pack / select、
+  transcript 的整段脚本在内存和 PG 上都比过）；只能绑回环地址；声明或实际超过上限的请求体 413（声明超了一字节都不读）。
+  手动起过一次（8750 先确认空闲，用完关掉）：`/v1/fit` 把旧的 tool 结果 mask 掉，145 → 49 估算 token；外来 Host 400。
+  收尾：`/simplify` + review（Codex 额度用完，Claude 子代理）。review 发现并修掉（先写失败的测试）：`heading` 不是合法
+  正则时 500；请求体按块拼接是平方级（30 MB、4 KB 一块要 9.5 秒，阻塞事件循环；改成 bytearray）；CLI 的端口、
+  请求体上限是坏值时抛 traceback（而且坏的端口会让 `pending` 都起不来）；库里 OpenAI adapter 把内容不是文本的 system
+  消息算作空文本放过去（现在 `UnsupportedInput`）。simplify 采纳：一个全局的错误处理代替每个路由的包装、摘要策略
+  字段合成一个 mixin、状态的编码走 codec、`accept_summary` 进库、`entries(after=)` 交给 store 过滤。变异检查 16 处都
+  被测试抓到；中途发现一个测试缺陷：改坏 `check_host` 时 `serve` 的测试会真的启动 uvicorn，现在 CLI 测试一律先把
+  `uvicorn.run` 换成会失败的桩。没采纳：错误码做成异常类的属性（现在由类名推出，改名会变——以后有第二个壳时再定）；
+  `heading` 正则的 ReDoS 只靠回环地址和 200 字符上限（Python `re` 没有超时）。
+  修完再 review 一轮：没有新 bug；两处小问题已修——带 NUL 的 transcript id 在 PG 上是 503（现在 `Transcript` 自己按和
+  codec 一样的规则检查 id，1–200 字符，所有 store 都 422）；请求体上限的报错提到一个不存在的 `--max_body` 参数。
+  接受的取舍：库里的 `ValueError` 都按 422 返回，库自身的 bug 若以 `ValueError` 出现也会是 422 而不是 500。
 
 ## 15. 待确认
 

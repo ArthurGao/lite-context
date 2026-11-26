@@ -150,3 +150,9 @@ def test_a_state_entry_round_trips_through_the_store() -> None:
         assert (await t.entries())[-1].item == fitted.state
 
     run(body)
+
+
+@pytest.mark.parametrize("bad", ["", "a\x00b", "a\ud800b", "x" * 201])
+def test_a_transcript_id_every_store_cannot_keep_is_refused(bad: str) -> None:
+    with pytest.raises(ValueError, match="transcript id"):
+        Transcript(InMemoryStore(), bad)

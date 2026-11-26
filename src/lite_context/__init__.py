@@ -1,6 +1,13 @@
 """lite-context: what each LLM call should see (docs/lite-context-design.md)."""
 
-from .compaction import CompactionPlan, Summary, SummaryPolicy, acompact, plan_compaction
+from .compaction import (
+    CompactionPlan,
+    Summary,
+    SummaryPolicy,
+    accept_summary,
+    acompact,
+    plan_compaction,
+)
 from .count import Budget, CharEstimate, Counter, count_message, count_messages
 from .errors import (
     BrokenPairing,
@@ -72,6 +79,7 @@ __all__ = [
     "UnknownTranscript",
     "UnreportedChange",
     "UnsupportedInput",
+    "accept_summary",
     "acompact",
     "count_message",
     "count_messages",

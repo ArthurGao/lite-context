@@ -299,3 +299,16 @@ def test_the_earlier_summary_goes_back_to_the_model_without_its_preamble() -> No
 
 def test_fewer_turns_than_kept_gives_no_plan() -> None:
     assert plan_compaction(history(2), policy=SummaryPolicy(keep_last_turns=4)) is None
+
+
+def test_accepting_from_the_plan_s_parts_equals_accepting_the_plan() -> None:
+    from lite_context.compaction import accept_summary
+
+    plan = plan_compaction(history(3), policy=POLICY)
+    assert plan is not None
+    by_parts = accept_summary(
+        "S", covered=plan.covered, mark=plan.mark, policy=plan.policy, provenance={"m": 1}, now=NOW
+    )
+    assert by_parts == plan.accept("S", provenance={"m": 1}, now=NOW)
+    with pytest.raises(ValueError, match="covered"):
+        accept_summary("S", covered=(), mark="m0", policy=POLICY, now=NOW)

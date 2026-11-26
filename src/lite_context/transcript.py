@@ -17,8 +17,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TypeAlias
 
-from .codec import item_to_record, record_to_item
-from .compaction import Summary, SummaryPolicy, acompact
+from .codec import UNSTORABLE, item_to_record, record_to_item
+from .compaction import CompactionPlan, Summary, SummaryPolicy, plan_compaction
 from .count import Budget, Counter
 from .fit import Fitted, fit
 from .state import ContextState
@@ -27,6 +27,7 @@ from .store import Record, Store
 from .types import Message
 
 Item: TypeAlias = Message | ContextState
+MAX_ID = 200
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,11 @@ class Transcript:
     processes may share a transcript, with `expected_seq` deciding who appends first."""
 
     def __init__(self, store: Store, id: str) -> None:
+        if not 1 <= len(id) <= MAX_ID or UNSTORABLE.search(id):
+            # The same for every store: PostgreSQL could not keep a NUL or a lone surrogate.
+            raise ValueError(
+                f"a transcript id is 1 to {MAX_ID} characters, with no NUL or lone surrogate"
+            )
         self.store = store
         self.id = id
 
@@ -64,10 +70,10 @@ class Transcript:
         await self.store.append(self.id, records, expected_seq=expected_seq)
         return expected_seq + len(records)
 
-    async def entries(self) -> list[Entry]:
-        return [
-            Entry(r.seq, record_to_item(r.kind, r.data)) for r in await self.store.read(self.id)
-        ]
+    async def entries(self, *, after: int = 0) -> list[Entry]:
+        """The entries after seq `after`, in order."""
+        records = await self.store.read(self.id, after=after)
+        return [Entry(r.seq, record_to_item(r.kind, r.data)) for r in records]
 
     async def project(
         self,
@@ -93,6 +99,17 @@ class Transcript:
             low=low,
         )
 
+    async def plan_compaction(
+        self, *, policy: SummaryPolicy | None = None
+    ) -> tuple[CompactionPlan | None, int]:
+        """The summarising call due now (`plan_compaction` over the messages and the latest
+        state), and the seq it was planned at: append the accepted state with that as
+        `expected_seq`, so a summary written while someone appended is refused (`SeqConflict`)."""
+        entries = await self.entries()
+        messages, state = _split(entries)
+        tail = entries[-1].seq if entries else 0
+        return plan_compaction(messages, state=state, policy=policy), tail
+
     async def compact(
         self,
         *,
@@ -100,16 +117,17 @@ class Transcript:
         policy: SummaryPolicy | None = None,
         now: datetime | None = None,
     ) -> int | None:
-        """Summarise what is due (`acompact`, with the caller's model) and append the new state;
-        returns its seq, or None when nothing new can be covered. Raises `SeqConflict` when
-        someone appended while the summary was being written: run it again."""
-        entries = await self.entries()
-        tail = entries[-1].seq if entries else 0
-        messages, state = _split(entries)
-        new = await acompact(messages, summarize=summarize, state=state, policy=policy, now=now)
-        if new is None:
+        """Summarise what is due with the caller's model and append the new state; returns its
+        seq, or None when nothing new can be covered. Raises `SeqConflict` when someone appended
+        while the summary was being written: run it again."""
+        plan, tail = await self.plan_compaction(policy=policy)
+        if plan is None:
             return None
-        return await self.append([new], expected_seq=tail)
+        reply = await summarize(plan.system, plan.prompt)
+        state = plan.accept(
+            reply.text, truncated=reply.truncated, provenance=reply.provenance, now=now
+        )
+        return await self.append([state], expected_seq=tail)
 
 
 def _split(entries: Sequence[Entry]) -> tuple[list[Message], ContextState | None]:

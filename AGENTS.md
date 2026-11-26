@@ -34,7 +34,7 @@ released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a
 v0.1.2 (reused call ids). **C4 2026-11-26: host A adopted it** in its own repository; host B was trialled and reverted, deferred
 by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). **C5 done
 2026-11-26**: `Transcript` (async), `InMemoryStore`, `PgStore` (extra `pg`), the message codec, `litecontext
-migrate` / `pending` (design §8); **v0.2.0 released 2026-11-26** (verified installed by URL with the `pg` extra on 3.11, against the local database). Next: C6 — the REST shell.
+migrate` / `pending` (design §8); **v0.2.0 released 2026-11-26** (verified installed by URL with the `pg` extra on 3.11, against the local database). **C6 done 2026-11-26**: the REST shell (`litecontext serve`, extra `server`, design §9); version 0.3.0, not yet released. Next: C7 — lite-agent adopts lite-context.
 
 ## Rules
 
@@ -78,10 +78,10 @@ Extras: `lite-model`, `tiktoken`, `pg` (psycopg 3), `server` (FastAPI), `eval`.
 
 ```
 uv run --env-file .env pytest    # every test; the PostgreSQL ones (C5) need LITECONTEXT_TEST_DATABASE_URL from .env and fail without it
-uv run --env-file .env --python 3.11 --isolated --with-editable '.[pg]' --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
+uv run --env-file .env --python 3.11 --isolated --with-editable '.[pg,server]' --with httpx==0.28.1 --with pytest==9.0.3 --with hypothesis==6.151.9 python -m pytest   # the 3.11 floor
 uv run ruff check && uv run ruff format --check && uv run mypy
 uv build --out-dir dist && uv venv --python 3.11 /tmp/c && uv pip install --python /tmp/c dist/*.whl && (cd /tmp && /tmp/c/bin/python -I $OLDPWD/scripts/smoke.py)   # the wheel alone
-uv run litecontext serve          # the REST shell, loopback :8750 (extra `server`, from C6)
+uv run --env-file .env litecontext serve   # the REST shell, loopback :8750 (extra `server`); transcripts need the database
 uv run --env-file .env litecontext migrate   # the Transcript tables (extra `pg`); `pending` lists what is not applied
 ```
 

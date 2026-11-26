@@ -140,23 +140,48 @@ class CompactionPlan:
         """The state to store: the new summary, and no cuts (they were measured on a history the
         summary now replaces, and the prompt cache starts again anyway; design §5.4).
         `provenance` is stored as JSON gives it back, and must be JSON."""
-        if truncated:
-            raise TruncatedSummary("the summary was cut off by the output limit")
-        text = self.policy.wrap(self.mark, reply)
-        if not text:
-            raise EmptySummary("the summary is empty")
-        try:
-            stored = json.loads(json.dumps(dict(provenance or {})))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"provenance must be JSON: {exc}") from exc
-        compaction = Compaction(
-            covers_through=self.covers_through,
-            covered_digest=digest(self.covered),
-            text=text,
-            provenance=stored,
-            created_at=(now or datetime.now(UTC)).isoformat(),
+        return accept_summary(
+            reply,
+            covered=self.covered,
+            mark=self.mark,
+            policy=self.policy,
+            truncated=truncated,
+            provenance=provenance,
+            now=now,
         )
-        return ContextState(compaction=compaction)
+
+
+def accept_summary(
+    reply: str,
+    *,
+    covered: Sequence[str],
+    mark: str,
+    policy: SummaryPolicy,
+    truncated: bool = False,
+    provenance: Mapping[str, object] | None = None,
+    now: datetime | None = None,
+) -> ContextState:
+    """`CompactionPlan.accept` from the parts of a plan that accepting reads: the covered keys,
+    the header mark and the policy. For a plan that travelled (the REST shell, design §9)."""
+    if not covered:
+        raise ValueError("a summary must cover at least one message (covered is empty)")
+    if truncated:
+        raise TruncatedSummary("the summary was cut off by the output limit")
+    text = policy.wrap(mark, reply)
+    if not text:
+        raise EmptySummary("the summary is empty")
+    try:
+        stored = json.loads(json.dumps(dict(provenance or {})))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"provenance must be JSON: {exc}") from exc
+    compaction = Compaction(
+        covers_through=covered[-1],
+        covered_digest=digest(covered),
+        text=text,
+        provenance=stored,
+        created_at=(now or datetime.now(UTC)).isoformat(),
+    )
+    return ContextState(compaction=compaction)
 
 
 def covered_end(messages: Sequence[Message], compaction: Compaction | None) -> int:
@@ -240,6 +265,7 @@ __all__ = [
     "CompactionPlan",
     "Summary",
     "SummaryPolicy",
+    "accept_summary",
     "acompact",
     "covered_end",
     "plan_compaction",

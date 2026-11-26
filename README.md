@@ -1,6 +1,6 @@
 # lite-context
 
-**v0.2.0** (2026-11-26; stage plan: design §14).
+**v0.3.0** (2026-11-26; stage plan: design §14).
 
 lite-context decides **what the model should see in this call**. Give it your full history (or a set of
 documents or retrieved chunks) and a token budget. It returns what to send this time and a report of what it
@@ -28,9 +28,9 @@ LLM layer.
 From the GitHub Release (lite-context is not on PyPI). Python 3.11 or 3.12, no dependencies:
 
 ```
-uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"
-pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"
-pip install "lite-context[pg] @ https://github.com/ArthurGao/lite-context/releases/download/v0.2.0/lite_context-0.2.0-py3-none-any.whl"   # PgStore
+uv add "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"
+pip install "lite-context @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"
+pip install "lite-context[pg,server] @ https://github.com/ArthurGao/lite-context/releases/download/v0.3.0/lite_context-0.3.0-py3-none-any.whl"   # PgStore, REST shell
 ```
 
 ## Example
@@ -89,6 +89,18 @@ fitted = await t.project(budget=Budget(200_000, 8_000), steps=steps)
 reply = my_llm.chat(messages=anthropic.from_messages(fitted.messages))
 await t.append([answer, fitted.state], expected_seq=seq)            # the state is an entry too
 ```
+
+Over HTTP, for a host in another language (`litecontext serve`, loopback only, port 8750):
+
+```
+curl -s http://127.0.0.1:8750/v1/fit -H 'content-type: application/json' -d '{
+  "format": "anthropic", "messages": [...],
+  "budget": {"limit": 200000, "reserve_output": 8000},
+  "steps": [{"step": "mask_tool_results", "keep_last": 3}]}'
+# -> {"messages": [...], "state": {...}, "report": {...}}; pass "state" back on the next call
+```
+
+Every endpoint is in design §9.
 
 `scripts/smoke.py` runs a complete example against the installed wheel.
 

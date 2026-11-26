@@ -34,7 +34,7 @@ released** (GitHub Release wheel, installed by URL; verified from pip 3.11 and a
 v0.1.2 (reused call ids). **C4 2026-11-26: host A adopted it** in its own repository; host B was trialled and reverted, deferred
 by the owner (design §14 records; measured on synthetic data, prompt-cache hits not measured). **C5 done
 2026-11-26**: `Transcript` (async), `InMemoryStore`, `PgStore` (extra `pg`), the message codec, `litecontext
-migrate` / `pending` (design §8); version 0.2.0, not yet released. Next: C6 — the REST shell.
+migrate` / `pending` (design §8); **v0.2.0 released 2026-11-26** (verified installed by URL with the `pg` extra on 3.11, against the local database). Next: C6 — the REST shell.
 
 ## Rules
 
